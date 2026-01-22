@@ -15,11 +15,13 @@ from collections import deque
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
 
+# 旗舰版配色
 COLOR_BG_MAIN = "#121212"
 COLOR_PANEL_LEFT = "#1a1a1a"
 COLOR_PANEL_RIGHT = "#0f0f0f"
 COLOR_CARD = "#2d2d2d"
 COLOR_ACCENT = "#3B8ED0"
+COLOR_ACCENT_HOVER = "#36719f"  # <--- [修复] 补全了缺失的颜色定义
 COLOR_CHART_LINE = "#00E676"
 COLOR_TEXT_WHITE = "#FFFFFF"
 COLOR_TEXT_GRAY = "#888888"
@@ -54,8 +56,9 @@ def set_high_priority():
     """提权：防止后台降速"""
     try:
         pid = os.getpid()
+        # 0x00008000 = ABOVE_NORMAL_PRIORITY_CLASS
         handle = ctypes.windll.kernel32.OpenProcess(0x0100 | 0x0200, False, pid)
-        ctypes.windll.kernel32.SetPriorityClass(handle, 0x00008000) # ABOVE_NORMAL_PRIORITY
+        ctypes.windll.kernel32.SetPriorityClass(handle, 0x00008000)
     except: pass
 
 def check_ffmpeg():
@@ -85,7 +88,7 @@ class InfinityScope(ctk.CTkCanvas):
     def __init__(self, master, **kwargs):
         super().__init__(master, bg=COLOR_PANEL_RIGHT, highlightthickness=0, **kwargs)
         self.points = [] 
-        self.max_val = 10.0 # 使用浮点数
+        self.max_val = 10.0
         self.bind("<Configure>", self.draw)
         
     def add_point(self, val):
@@ -105,17 +108,14 @@ class InfinityScope(ctk.CTkCanvas):
         h = self.winfo_height()
         n = len(self.points)
         
-        # === 修复抽动核心 ===
-        # 1. 获取当前数据的真实峰值
+        # 平滑缩放算法，防止图表抽搐
         data_max = max(self.points) if self.points else 10
-        target_max = max(data_max, 10) * 1.1 # 留出 10% 的顶部余量，防止贴顶
+        target_max = max(data_max, 10) * 1.1 
         
-        # 2. 缓动跟随：max_val 慢慢接近 target_max，而不是直接跳变
-        # 如果 target > current，快速扩张；如果 target < current，缓慢收缩
         if target_max > self.max_val:
             self.max_val += (target_max - self.max_val) * 0.1
         else:
-            self.max_val += (target_max - self.max_val) * 0.05 # 收缩更慢，避免频繁抖动
+            self.max_val += (target_max - self.max_val) * 0.05
             
         scale_y = (h - 20) / self.max_val
         
@@ -139,7 +139,6 @@ class MonitorChannel(ctk.CTkFrame):
     def __init__(self, master, ch_id, **kwargs):
         super().__init__(master, fg_color="#181818", corner_radius=10, border_width=1, border_color="#333", **kwargs)
         
-        # 头部
         head = ctk.CTkFrame(self, fg_color="transparent", height=25)
         head.pack(fill="x", padx=15, pady=(10,0))
         self.lbl_title = ctk.CTkLabel(head, text=f"通道 {ch_id} · 空闲", font=("微软雅黑", 12, "bold"), text_color="#555")
@@ -150,16 +149,13 @@ class MonitorChannel(ctk.CTkFrame):
         self.scope = InfinityScope(self)
         self.scope.pack(fill="both", expand=True, padx=2, pady=5)
         
-        # 底部数据
         btm = ctk.CTkFrame(self, fg_color="transparent")
         btm.pack(fill="x", padx=15, pady=(0,10))
         
-        # 左侧：FPS
         self.lbl_fps = ctk.CTkLabel(btm, text="0", font=("Impact", 20), text_color="#333")
         self.lbl_fps.pack(side="left")
         ctk.CTkLabel(btm, text="FPS", font=("Arial", 10, "bold"), text_color="#444").pack(side="left", padx=(5,0), pady=(8,0))
         
-        # 右侧：进度 + ETA
         self.lbl_eta = ctk.CTkLabel(btm, text="ETA: --:--", font=("Consolas", 12), text_color="#666")
         self.lbl_eta.pack(side="right", padx=(10, 0))
         self.lbl_prog = ctk.CTkLabel(btm, text="0%", font=("Arial", 14, "bold"), text_color="#333")
@@ -192,7 +188,7 @@ class TaskCard(ctk.CTkFrame):
     def __init__(self, master, index, filepath, **kwargs):
         super().__init__(master, fg_color=COLOR_CARD, corner_radius=10, border_width=0, **kwargs)
         self.grid_columnconfigure(1, weight=1)
-        self.status_code = 0 
+        self.status_code = 0 # 0:Wait, 1:Run, 2:Done, -1:Error
         
         ctk.CTkLabel(self, text=f"{index:02d}", font=("Impact", 20), text_color="#555").grid(row=0, column=0, rowspan=2, padx=15)
         ctk.CTkLabel(self, text=os.path.basename(filepath), font=("微软雅黑", 12, "bold"), text_color="#EEE", anchor="w").grid(row=0, column=1, sticky="w", padx=5, pady=(8,0))
@@ -214,12 +210,10 @@ class UltraEncoderApp(DnDWindow):
         super().__init__()
         set_high_priority() # 提权
         
-        self.title("Ultra Encoder v18 - Final Stable")
+        self.title("Ultra Encoder v19 - Final Fixed")
         self.geometry("1300x850")
         self.configure(fg_color=COLOR_BG_MAIN)
-        
-        # 1. 限制最小窗口，防止按钮消失
-        self.minsize(1100, 750)
+        self.minsize(1100, 750) # 窗口保护
         
         self.file_queue = [] 
         self.task_widgets = {}
@@ -286,7 +280,6 @@ class UltraEncoderApp(DnDWindow):
         self.scroll = ctk.CTkScrollableFrame(left, fg_color="transparent")
         self.scroll.pack(fill="both", expand=True, padx=10, pady=10)
         
-        # 参数区
         l_btm = ctk.CTkFrame(left, fg_color="#222", corner_radius=20)
         l_btm.pack(fill="x", padx=15, pady=20, ipadx=5, ipady=5)
         
@@ -294,10 +287,10 @@ class UltraEncoderApp(DnDWindow):
         row1 = ctk.CTkFrame(l_btm, fg_color="transparent")
         row1.pack(fill="x", pady=(15, 5), padx=10)
         ctk.CTkLabel(row1, text="编码格式", font=("微软雅黑", 12, "bold"), text_color="#DDD").pack(anchor="w")
-        self.codec_var = ctk.StringVar(value="H.264") # 默认 264
+        self.codec_var = ctk.StringVar(value="H.264")
         self.seg_codec = ctk.CTkSegmentedButton(row1, values=["H.264", "H.265"], variable=self.codec_var, selected_color=COLOR_ACCENT, corner_radius=10)
         self.seg_codec.pack(fill="x", pady=(5, 0))
-        ctk.CTkLabel(row1, text="H.264: 最佳兼容性 | H.265: 最小体积", font=("微软雅黑", 10), text_color="#666").pack(anchor="w")
+        ctk.CTkLabel(row1, text="H.264: 兼容性最佳 (推荐) | H.265: 体积更小", font=("微软雅黑", 10), text_color="#666").pack(anchor="w")
         
         # 2. 画质
         row2 = ctk.CTkFrame(l_btm, fg_color="transparent")
@@ -321,6 +314,7 @@ class UltraEncoderApp(DnDWindow):
                                                width=100, corner_radius=10, command=self.update_monitor_layout)
         self.seg_worker.pack(pady=2)
         ctk.CTkLabel(w_box, text="建议 2-3 个", font=("微软雅黑", 10), text_color="#666").pack(anchor="w")
+        
         g_box = ctk.CTkFrame(row3, fg_color="transparent")
         g_box.pack(side="right")
         self.gpu_var = ctk.BooleanVar(value=True)
@@ -499,8 +493,7 @@ class UltraEncoderApp(DnDWindow):
         is_h265 = "H.265" in codec_sel
         tag = "HEVC" if is_h265 else "AVC"
         
-        # 2. 命名修改: _Compressed_264 或 _Compressed_265
-        suffix = "_Compressed_265" if is_h265 else "_Compressed_264"
+        suffix = "_Compressed_H265" if is_h265 else "_Compressed_H264"
         temp_out = os.path.join(self.temp_dir, f"TMP_{name}{suffix}{ext}")
         final_out = os.path.join(os.path.dirname(input_file), f"{name}{suffix}{ext}")
         
@@ -518,7 +511,7 @@ class UltraEncoderApp(DnDWindow):
             cmd.extend(["-c:v", enc, "-crf", crf, "-preset", "medium"])
         cmd.extend(["-c:a", "copy", temp_out])
 
-        start_time = time.time() # 记录开始时间用于计算ETA
+        start_time = time.time()
 
         try:
             duration = self.get_dur(input_file)
@@ -541,7 +534,6 @@ class UltraEncoderApp(DnDWindow):
                         
                         now = time.time()
                         if now - last_t > 0.1: 
-                            # 5. 计算ETA
                             elapsed = now - start_time
                             eta_str = "--:--"
                             if prog > 0.01:
@@ -562,7 +554,6 @@ class UltraEncoderApp(DnDWindow):
                 orig = os.path.getsize(input_file)
                 new = os.path.getsize(final_out)
                 sv = 100 - (new/orig*100)
-                # 3. 状态文案更新: 完成 | 压缩比: 46.0%
                 status_txt = f"完成 | 压缩比: {sv:.1f}%"
                 self.after(0, lambda: [card.set_status(status_txt, COLOR_SUCCESS, 2), card.set_progress(1)])
             else:
