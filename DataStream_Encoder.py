@@ -25,15 +25,17 @@ COLOR_TEXT_WHITE = "#FFFFFF"
 COLOR_TEXT_GRAY = "#888888"
 COLOR_SUCCESS = "#2ECC71" # 绿色 (就绪)
 COLOR_MOVING = "#F1C40F"  # 金色 (移动/IO)
-COLOR_READING = "#9B59B6" # 紫色 (预读内存)
+COLOR_READING = "#9B59B6" # 紫色 (预读)
 COLOR_RAM     = "#3498DB" # 蓝色 (驻留内存)
+COLOR_SSD_CACHE = "#E67E22" # 橙色 (SSD缓存)
+COLOR_DIRECT  = "#1ABC9C" # 青色 (直读)
 COLOR_PAUSED = "#7f8c8d"  # 灰色
 COLOR_ERROR = "#FF4757"   # 红色
 
 # 状态码
 STATUS_WAIT = 0
-STATUS_LOADING = 1   # 正在读入内存
-STATUS_RAM_READY = 2 # 已在内存中
+STATUS_CACHING = 1   # 正在载入(内存或SSD)
+STATUS_READY = 2     # 就绪
 STATUS_RUN = 3       # 压制中
 STATUS_DONE = 5
 STATUS_ERR = -1
@@ -68,13 +70,53 @@ def get_free_ram_gb():
         stat.dwLength = ctypes.sizeof(stat)
         ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
         return stat.ullAvailPhys / (1024**3)
-    except: return 4.0 # 兜底
+    except: return 8.0 
 
 def check_ffmpeg():
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         return True
     except: return False
+
+def get_force_ssd_dir():
+    # 自动寻找最大的空闲分区作为缓存
+    drives = ["D", "E", "F", "G", "C"]
+    best = None
+    max_free = 0
+    for d in drives:
+        root = f"{d}:\\"
+        if os.path.exists(root):
+            try:
+                free = shutil.disk_usage(root).free
+                if free > max_free and free > 50*1024**3:
+                    max_free = free
+                    best = root
+            except: pass
+    if not best: best = "C:\\" 
+    path = os.path.join(best, "_Ultra_Smart_Cache_")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+# === 磁盘类型检测 ===
+drive_type_cache = {}
+def is_drive_ssd(path):
+    drive_letter = os.path.splitdrive(path)[0]
+    if not drive_letter: return False
+    drive_letter = drive_letter.upper()
+    
+    if drive_letter in drive_type_cache:
+        return drive_type_cache[drive_letter]
+    
+    try:
+        # 使用 PowerShell 检测物理磁盘类型
+        cmd = f'Get-Partition -DriveLetter {drive_letter[0]} | Get-Disk | Select-Object -ExpandProperty MediaType'
+        result = subprocess.check_output(["powershell", "-Command", cmd], creationflags=subprocess.CREATE_NO_WINDOW).decode().strip()
+        is_ssd = "SSD" in result.upper()
+        drive_type_cache[drive_letter] = is_ssd
+        return is_ssd
+    except:
+        # 如果检测失败，保守起见认为是 HDD (进行缓存)
+        return False
 
 # === 组件定义 ===
 class InfinityScope(ctk.CTkCanvas):
@@ -169,9 +211,11 @@ class TaskCard(ctk.CTkFrame):
         super().__init__(master, fg_color=COLOR_CARD, corner_radius=10, border_width=0, **kwargs)
         self.grid_columnconfigure(1, weight=1)
         self.status_code = STATUS_WAIT 
-        # 这里不存文件路径了，存内存块
+        
+        # 缓存数据
         self.ram_data = None 
-        self.is_large_file = False # 标记是否因文件过大而跳过内存缓存
+        self.ssd_cache_path = None
+        self.source_mode = "PENDING" # RAM / SSD_CACHE / DIRECT
         
         ctk.CTkLabel(self, text=f"{index:02d}", font=("Impact", 20), text_color="#555").grid(row=0, column=0, rowspan=2, padx=15)
         ctk.CTkLabel(self, text=os.path.basename(filepath), font=("微软雅黑", 12, "bold"), text_color="#EEE", anchor="w").grid(row=0, column=1, sticky="w", padx=5, pady=(8,0))
@@ -199,7 +243,7 @@ class TaskCard(ctk.CTkFrame):
 class UltraEncoderApp(DnDWindow):
     def __init__(self):
         super().__init__()
-        self.title("Ultra Encoder v42 - Pure RAM Pipeline")
+        self.title("Ultra Encoder v43 - Hybrid Smart Pipeline")
         self.geometry("1300x900")
         self.configure(fg_color=COLOR_BG_MAIN)
         self.minsize(1200, 850) 
@@ -221,6 +265,8 @@ class UltraEncoderApp(DnDWindow):
         
         self.executor = ThreadPoolExecutor(max_workers=16) 
         self.submitted_tasks = set() 
+        self.temp_dir = ""
+        self.temp_files = set()
         
         self.setup_ui()
         self.after(200, self.sys_check)
@@ -261,6 +307,7 @@ class UltraEncoderApp(DnDWindow):
         for p in self.active_procs:
             try: p.terminate(); p.kill()
             except: pass
+        self.clean_junk()
         self.destroy()
         os._exit(0)
 
@@ -268,8 +315,14 @@ class UltraEncoderApp(DnDWindow):
         if not check_ffmpeg():
             messagebox.showerror("错误", "找不到 FFmpeg！")
             return
-        threading.Thread(target=self.ram_preload_worker, daemon=True).start()
+        threading.Thread(target=self.scan_disk, daemon=True).start()
+        threading.Thread(target=self.smart_preload_worker, daemon=True).start()
         self.update_monitor_layout()
+
+    def scan_disk(self):
+        path = get_force_ssd_dir()
+        self.temp_dir = path
+        self.after(0, lambda: self.btn_cache.configure(text=f"Cache Pool: {path}"))
 
     def set_status_bar(self, text):
         self.lbl_global_status.configure(text=f"状态: {text}")
@@ -287,7 +340,10 @@ class UltraEncoderApp(DnDWindow):
         l_head.pack(fill="x", padx=20, pady=(25, 10))
         ctk.CTkLabel(l_head, text="ULTRA ENCODER", font=("Impact", 26), text_color="#FFF").pack(anchor="w")
         
-        # 显示 RAM 状态
+        self.btn_cache = ctk.CTkButton(left, text="Checking...", fg_color="#252525", hover_color="#333", 
+                                     text_color="#AAA", font=("Consolas", 10), height=28, corner_radius=14, command=self.open_cache)
+        self.btn_cache.pack(fill="x", padx=20, pady=(5, 5))
+        
         self.btn_ram = ctk.CTkButton(left, text="RAM Monitor...", fg_color="#252525", hover_color="#333", 
                                      text_color="#AAA", font=("Consolas", 10), height=28, corner_radius=14, state="disabled")
         self.btn_ram.pack(fill="x", padx=20, pady=(5, 5))
@@ -296,7 +352,6 @@ class UltraEncoderApp(DnDWindow):
         tools.pack(fill="x", padx=15, pady=5)
         ctk.CTkButton(tools, text="+ 导入", width=120, height=36, corner_radius=18, 
                      fg_color="#333", hover_color="#444", command=self.add_file).pack(side="left", padx=5)
-        
         self.btn_clear = ctk.CTkButton(tools, text="清空", width=60, height=36, corner_radius=18, 
                      fg_color="transparent", border_width=1, border_color="#444", hover_color="#331111", text_color="#CCC", command=self.clear_all)
         self.btn_clear.pack(side="left", padx=5)
@@ -385,44 +440,73 @@ class UltraEncoderApp(DnDWindow):
             ch.pack(fill="both", expand=True, pady=5)
             self.monitor_slots.append(ch)
 
-    # === 核心逻辑 1：将文件读入 RAM ===
-    def load_to_ram(self, src_path, widget):
+    # === 核心逻辑：智能缓存处理 ===
+    def process_caching(self, src_path, widget):
+        # 1. 检测源是否为 SSD
+        self.after(0, lambda: [widget.set_status("🔍 检测磁盘类型...", COLOR_READING, STATUS_CACHING)])
+        
+        is_ssd = is_drive_ssd(src_path)
+        if is_ssd:
+            # SSD 源 -> 直读 (最省寿命，速度也够)
+            self.after(0, lambda: [widget.set_status("就绪 (SSD直读)", COLOR_DIRECT, STATUS_READY)])
+            widget.source_mode = "DIRECT"
+            return True
+
+        # 2. 如果是 HDD，尝试载入 RAM
         file_size_gb = os.path.getsize(src_path) / (1024**3)
         free_ram = get_free_ram_gb()
-        
-        # 安全线：文件必须小于空闲内存的 70%，且留给系统至少 4GB
-        safe_margin = 4.0 
-        if file_size_gb > (free_ram - safe_margin):
-            # 内存不够，标记为大文件，后续直接从硬盘读
-            self.after(0, lambda: [widget.set_status("文件过大 > 硬盘直读", COLOR_PAUSED, STATUS_RAM_READY)])
-            widget.is_large_file = True
-            return True # 算作“准备好了”
-        
-        # 开始读取
-        self.after(0, lambda: [widget.set_status("📥 载入内存中...", COLOR_READING, STATUS_LOADING), widget.set_progress(0, COLOR_READING)])
-        
+        safe_reserve = 6.0 # 留给系统 6GB
+        available_for_cache = free_ram - safe_reserve
+
+        if available_for_cache > file_size_gb:
+            # 内存够用 -> RAM 缓存
+            self.after(0, lambda: [widget.set_status("📥 载入内存中...", COLOR_RAM, STATUS_CACHING), widget.set_progress(0, COLOR_RAM)])
+            try:
+                with open(src_path, 'rb') as f:
+                    widget.ram_data = f.read()
+                self.after(0, lambda: [widget.set_status("就绪 (RAM)", COLOR_RAM, STATUS_READY), widget.set_progress(1, COLOR_RAM)])
+                widget.source_mode = "RAM"
+                return True
+            except Exception as e:
+                # 内存读取失败（极少情况），降级到 SSD Cache
+                print(f"RAM Load Failed: {e}, Fallback to SSD Cache")
+                pass
+
+        # 3. 内存不够或HDD -> SSD 缓存 (默认开启)
+        self.after(0, lambda: [widget.set_status("📥 写入SSD缓存...", COLOR_SSD_CACHE, STATUS_CACHING), widget.set_progress(0, COLOR_SSD_CACHE)])
         try:
-            with open(src_path, 'rb') as f:
-                # 一次性读取虽然快，但大文件会卡 UI，所以分块读入 bytearray
-                # 为了简单和性能，这里采用大块读取拼合
-                widget.ram_data = f.read() 
-                
-            self.after(0, lambda: [widget.set_status("就绪 (RAM)", COLOR_RAM, STATUS_RAM_READY), widget.set_progress(1, COLOR_RAM)])
+            fname = os.path.basename(src_path)
+            cache_path = os.path.join(self.temp_dir, f"CACHE_{int(time.time())}_{fname}")
+            
+            total = os.path.getsize(src_path)
+            copied = 0
+            with open(src_path, 'rb') as fsrc:
+                with open(cache_path, 'wb') as fdst:
+                    while True:
+                        if self.stop_flag: 
+                            fdst.close(); os.remove(cache_path); return False
+                        chunk = fsrc.read(16*1024*1024)
+                        if not chunk: break
+                        fdst.write(chunk)
+                        copied += len(chunk)
+                        self.after(0, lambda p=copied/total: widget.set_progress(p, COLOR_SSD_CACHE))
+            
+            self.temp_files.add(cache_path)
+            widget.ssd_cache_path = cache_path
+            widget.source_mode = "SSD_CACHE"
+            self.after(0, lambda: [widget.set_status("就绪 (SSD缓存)", COLOR_SSD_CACHE, STATUS_READY), widget.set_progress(1, COLOR_SSD_CACHE)])
             return True
         except Exception as e:
-            print(f"RAM Load Error: {e}")
-            self.after(0, lambda: widget.set_status("内存载入失败", COLOR_ERROR, STATUS_ERR))
+            self.after(0, lambda: widget.set_status("缓存失败", COLOR_ERROR, STATUS_ERR))
             return False
 
-    # === 核心逻辑 2：智能 RAM 预读线程 ===
-    def ram_preload_worker(self):
+    # === 智能预读线程 ===
+    def smart_preload_worker(self):
         while True:
-            # 更新 RAM 显示
             free = get_free_ram_gb()
             self.after(0, lambda f=free: self.btn_ram.configure(text=f"Free RAM: {f:.1f} GB"))
             
             if self.running and not self.stop_flag:
-                # 尝试获取读取锁
                 if not self.read_lock.acquire(blocking=False):
                     time.sleep(0.5); continue
                 
@@ -431,20 +515,20 @@ class UltraEncoderApp(DnDWindow):
                 with self.queue_lock: 
                     for f in self.file_queue:
                         w = self.task_widgets.get(f)
-                        # 找还没载入 RAM 的任务
-                        if w and w.status_code == STATUS_WAIT and w.ram_data is None and not w.is_large_file:
+                        # 找没处理过且没开始压制的
+                        if w and w.status_code == STATUS_WAIT and w.source_mode == "PENDING":
                             target_file, target_widget = f, w
                             break 
                 
                 if target_file and target_widget:
-                    self.load_to_ram(target_file, target_widget)
+                    self.process_caching(target_file, target_widget)
                 
                 self.read_lock.release()
                 time.sleep(0.5) 
             else:
                 time.sleep(1)
 
-    # === 引擎调度 ===
+    # === 引擎 ===
     def engine(self):
         while not self.stop_flag:
             tasks_to_run = []
@@ -459,8 +543,7 @@ class UltraEncoderApp(DnDWindow):
                         if f in self.submitted_tasks: continue 
                         
                         card = self.task_widgets[f]
-                        # 只要状态不是完成或错误，就可以提交
-                        if card.status_code in [STATUS_WAIT, STATUS_LOADING, STATUS_RAM_READY]:
+                        if card.status_code in [STATUS_WAIT, STATUS_CACHING, STATUS_READY]:
                             tasks_to_run.append(f)
                             self.submitted_tasks.add(f)
                             slots_free -= 1
@@ -486,7 +569,7 @@ class UltraEncoderApp(DnDWindow):
         self.running = False
         self.after(0, self.reset_ui_state)
 
-    # === 核心 Worker：从 RAM 管道压制 ===
+    # === Worker ===
     def process(self, input_file):
         if self.stop_flag: return
         my_slot_idx = None
@@ -498,17 +581,16 @@ class UltraEncoderApp(DnDWindow):
 
         card = self.task_widgets[input_file]
         
-        # 等待预读完成
-        while card.status_code == STATUS_LOADING and not self.stop_flag: 
+        # 等待缓存完成
+        while card.status_code == STATUS_CACHING and not self.stop_flag: 
             time.sleep(0.5)
 
-        # 如果还没预读（且不是大文件），Worker 尝试自己读
-        if card.ram_data is None and not card.is_large_file:
+        # 如果还没缓存（Worker赶在了预读前面），自己做
+        if card.source_mode == "PENDING":
             self.read_lock.acquire()
             try:
-                # 双重检查
-                if card.ram_data is None and not card.is_large_file and not self.stop_flag:
-                   self.load_to_ram(input_file, card)
+                if card.source_mode == "PENDING" and not self.stop_flag:
+                   self.process_caching(input_file, card)
             finally:
                 self.read_lock.release()
         
@@ -517,8 +599,9 @@ class UltraEncoderApp(DnDWindow):
         # --- 开始压制 ---
         try:
             ch_ui = self.monitor_slots[my_slot_idx]
-            source_type = "RAM" if card.ram_data else "DISK"
-            self.after(0, lambda: [card.set_status(f"▶️ 压制中 ({source_type})", COLOR_ACCENT, STATUS_RUN), card.set_progress(0, COLOR_ACCENT)])
+            mode_label = {"DIRECT": "SSD直读", "RAM": "内存加速", "SSD_CACHE": "缓存加速"}.get(card.source_mode, "Unknown")
+            
+            self.after(0, lambda: [card.set_status(f"▶️ 压制中 ({mode_label})", COLOR_ACCENT, STATUS_RUN), card.set_progress(0, COLOR_ACCENT)])
             
             fname = os.path.basename(input_file)
             name, ext = os.path.splitext(fname)
@@ -533,38 +616,39 @@ class UltraEncoderApp(DnDWindow):
             v_codec = "hevc_nvenc" if "H.265" in codec_sel else "h264_nvenc"
             if not self.gpu_var.get(): v_codec = "libx265" if "H.265" in codec_sel else "libx264"
             
-            # 关键：如果是 RAM 模式，输入改为 pipe:0 (stdin)
-            input_arg = "pipe:0" if card.ram_data else input_file
+            # 确定输入源
+            input_arg = input_file # 默认: DIRECT
+            if card.source_mode == "RAM": input_arg = "pipe:0"
+            elif card.source_mode == "SSD_CACHE": input_arg = card.ssd_cache_path
             
             cmd = ["ffmpeg", "-y", "-i", input_arg, "-c:v", v_codec]
-            
             if self.gpu_var.get():
                 cmd.extend(["-pix_fmt", "yuv420p", "-rc", "vbr", "-cq", str(self.crf_var.get()), "-preset", "p6", "-spatial-aq", "1"])
             else:
                 cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
             cmd.extend(["-c:a", "copy", final_out])
             
-            duration = self.get_dur(input_file) # 此时必须读硬盘获取时长，很快
+            # 获取时长
+            dur_file = input_file if card.source_mode != "SSD_CACHE" else card.ssd_cache_path
+            duration = self.get_dur(dur_file)
             
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            # 开启 stdin 管道
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if card.ram_data else None, 
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if card.source_mode == "RAM" else None, 
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                    universal_newlines=True, encoding='utf-8', errors='ignore', startupinfo=si)
             self.active_procs.append(proc)
             
-            # 如果是 RAM 模式，开启线程喂数据，防止死锁
+            # RAM 喂食线程
             def feed_stdin():
                 try:
                     if card.ram_data:
-                        # 必须用 buffer write bytes
                         proc.stdin.buffer.write(card.ram_data)
                         proc.stdin.buffer.close()
                 except: pass
             
-            if card.ram_data:
+            if card.source_mode == "RAM":
                 threading.Thread(target=feed_stdin, daemon=True).start()
             
             start_t = time.time()
@@ -589,8 +673,13 @@ class UltraEncoderApp(DnDWindow):
             if proc in self.active_procs: self.active_procs.remove(proc)
             success = (not self.stop_flag and proc.returncode == 0)
             
-            # 释放内存
-            card.ram_data = None 
+            # 清理资源
+            card.ram_data = None
+            if card.ssd_cache_path:
+                try: 
+                    os.remove(card.ssd_cache_path)
+                    self.temp_files.remove(card.ssd_cache_path)
+                except: pass
             
             self.after(0, ch_ui.reset)
             with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
@@ -624,8 +713,8 @@ class UltraEncoderApp(DnDWindow):
         self.active_procs = []
         with self.queue_lock:
             for f, card in self.task_widgets.items():
-                card.ram_data = None # 清空内存
-                if card.status_code in [STATUS_RUN, STATUS_LOADING, STATUS_RAM_READY]:
+                card.ram_data = None 
+                if card.status_code in [STATUS_RUN, STATUS_CACHING, STATUS_READY]:
                     card.set_status("已停止", COLOR_TEXT_GRAY, STATUS_WAIT)
                     card.set_progress(0)
         self.submitted_tasks.clear()
@@ -636,6 +725,8 @@ class UltraEncoderApp(DnDWindow):
         self.btn_run.configure(state="normal", text="启动引擎")
         self.btn_stop.configure(state="disabled")
 
+    def open_cache(self):
+        if self.temp_dir: os.startfile(self.temp_dir)
     def add_file(self):
         f_list = filedialog.askopenfilenames()
         self.add_list(f_list)
@@ -662,6 +753,12 @@ class UltraEncoderApp(DnDWindow):
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             return float(subprocess.check_output(cmd, startupinfo=si).strip())
         except: return 0
+
+    def clean_junk(self):
+        for f in list(self.temp_files):
+            try: os.remove(f)
+            except: pass
+        self.temp_files.clear()
 
 if __name__ == "__main__":
     app = UltraEncoderApp()
