@@ -223,7 +223,7 @@ class TaskCard(ctk.CTkFrame):
 class UltraEncoderApp(DnDWindow):
     def __init__(self):
         super().__init__()
-        self.title("Ultra Encoder v40 - Strict Order")
+        self.title("Ultra Encoder v40 - Strict Sequential & Fixed Naming")
         self.geometry("1300x900")
         self.configure(fg_color=COLOR_BG_MAIN)
         self.minsize(1200, 850) 
@@ -427,9 +427,8 @@ class UltraEncoderApp(DnDWindow):
                 if get_free_ram_gb() < 8.0: 
                     time.sleep(2); continue
                 
-                # [策略调整] 
-                # 预读器也必须遵守 submitted_tasks 的计数逻辑
-                # 如果活跃任务数 < 并发数，说明有空位，让工人直接去抢，不要预读
+                # 策略：如果工人没满，不预读，让工人优先
+                # [Fix 2] 保持与 engine 一致，看已提交的任务数
                 active_workers = len(self.submitted_tasks)
                 
                 if active_workers < self.current_workers:
@@ -441,9 +440,8 @@ class UltraEncoderApp(DnDWindow):
                 target_file, target_widget = None, None
                 with self.queue_lock: 
                     for f in self.file_queue:
-                        # [关键] 绝对不能碰已经提交给线程池的任务
+                        # 跳过已经提交的，只预读还没被提交的任务
                         if f in self.submitted_tasks: continue
-                        
                         w = self.task_widgets.get(f)
                         if w and w.status_code == STATUS_WAIT:
                             target_file, target_widget = f, w
@@ -479,9 +477,9 @@ class UltraEncoderApp(DnDWindow):
             tasks_to_run = []
             
             # [核心修复 v40] 
-            # 统计活跃任务不再看 STATUS_RUN，而是看 submitted_tasks 集合的大小。
-            # 只要提交了（不管是在排队、等待RAM、还是正在压制），都算占用了一个工位。
-            # 这强制了严格的顺序，防止后来的任务插队。
+            # 严格模式：只看 submitted_tasks 的数量，不看 status_code。
+            # 只要提交了（不管是在排队、等待RAM、还是正在压制），都算占位。
+            # 这强制了严格的 FIFO 顺序，防止后来的任务因为加载快而插队。
             active_count = len(self.submitted_tasks)
             slots_free = self.current_workers - active_count
             
@@ -491,7 +489,6 @@ class UltraEncoderApp(DnDWindow):
                     for f in self.file_queue:
                         if slots_free <= 0: break
                         
-                        # 已经提交的跳过
                         if f in self.submitted_tasks: continue 
                         
                         card = self.task_widgets[f]
@@ -499,7 +496,7 @@ class UltraEncoderApp(DnDWindow):
                         if card.status_code in [STATUS_WAIT, STATUS_READ, STATUS_READY]:
                             tasks_to_run.append(f)
                             self.submitted_tasks.add(f) # 立即标记为已占用
-                            slots_free -= 1 # 立即扣减工位
+                            slots_free -= 1 # 立即扣减槽位
             
             # 检查是否全部完成 (队列非空 + 无运行中任务 + 没东西可跑)
             if not tasks_to_run and active_count == 0 and self.file_queue:
@@ -561,7 +558,9 @@ class UltraEncoderApp(DnDWindow):
             gpu_flag = "GPU" if self.gpu_var.get() else "CPU"
             self.after(0, lambda: ch_ui.activate(fname, f"{tag} | {gpu_flag}"))
             
-            suffix = "_Ultra_265" if "H.265" in codec_sel else "_Ultra_264"
+            # [Fix 3] 回滚命名逻辑
+            suffix = "_Compressed_H265" if "H.265" in codec_sel else "_Compressed_H264"
+            
             temp_out = os.path.join(self.temp_dir, f"TMP_{name}{suffix}{ext}")
             final_out = os.path.join(os.path.dirname(input_file), f"{name}{suffix}{ext}")
             self.temp_files.add(temp_out)
@@ -616,7 +615,7 @@ class UltraEncoderApp(DnDWindow):
                 threading.Thread(target=self.move_worker, args=(temp_out, final_out, card, os.path.getsize(input_file))).start()
         finally:
             if lock_acquired and self.read_lock.locked(): self.read_lock.release()
-            # [关键] 只有当处理彻底完成（或出错退出）时，才释放“占用名额”，允许下一个任务进来
+            # 释放占位
             with self.queue_lock:
                 if input_file in self.submitted_tasks: self.submitted_tasks.remove(input_file)
 
