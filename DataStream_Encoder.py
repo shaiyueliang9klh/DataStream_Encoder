@@ -30,7 +30,7 @@ COLOR_READING = "#9B59B6"
 COLOR_PAUSED = "#7f8c8d"  
 COLOR_ERROR = "#FF4757"   
 
-# 状态码定义
+# 状态码
 STATUS_WAIT = 0
 STATUS_RUN = 1
 STATUS_DONE = 2
@@ -39,12 +39,11 @@ STATUS_READ = 4
 STATUS_READY = 5
 STATUS_ERR = -1
 
-# 优先级常量
+# 优先级
 PRIORITY_NORMAL = 0x00000020
 PRIORITY_ABOVE = 0x00008000
 PRIORITY_HIGH = 0x00000080
 
-# 拖拽支持检查
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     class DnDWindow(ctk.CTk, TkinterDnD.DnDWrapper):
@@ -56,7 +55,6 @@ except ImportError:
     class DnDWindow(ctk.CTk): pass
     HAS_DND = False
 
-# === 硬件底层 ===
 class MEMORYSTATUSEX(ctypes.Structure):
     _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
 
@@ -90,44 +88,33 @@ def get_force_ssd_dir():
     os.makedirs(path, exist_ok=True)
     return path
 
-# === 组件 ===
+# === UI组件 ===
 class InfinityScope(ctk.CTkCanvas):
     def __init__(self, master, **kwargs):
         super().__init__(master, bg=COLOR_PANEL_RIGHT, highlightthickness=0, **kwargs)
         self.points = [] 
         self.max_val = 10.0
         self.bind("<Configure>", self.draw)
-        
     def add_point(self, val):
-        self.points.append(val)
-        self.draw()
-        
+        self.points.append(val); self.draw()
     def clear(self):
-        self.points = []
-        self.max_val = 10.0
-        self.delete("all")
-        
+        self.points = []; self.max_val = 10.0; self.delete("all")
     def draw(self, event=None):
         self.delete("all")
         if not self.points: return
-        w = self.winfo_width()
-        h = self.winfo_height()
-        n = len(self.points)
+        w = self.winfo_width(); h = self.winfo_height(); n = len(self.points)
+        if w < 10 or h < 10: return
         data_max = max(self.points) if self.points else 10
         target_max = max(data_max, 10) * 1.1 
-        if target_max > self.max_val: self.max_val += (target_max - self.max_val) * 0.1
-        else: self.max_val += (target_max - self.max_val) * 0.05
+        self.max_val += (target_max - self.max_val) * 0.1 if target_max > self.max_val else (target_max - self.max_val) * 0.05
         scale_y = (h - 20) / self.max_val
         self.create_line(0, h/2, w, h/2, fill="#2a2a2a", dash=(4,4))
         if n < 2: return
         step_x = w / (n - 1)
         coords = []
         for i, val in enumerate(self.points):
-            x = i * step_x
-            y = h - (val * scale_y) - 10
-            coords.extend([x, y])
-        if len(coords) >= 4:
-            self.create_line(coords, fill=COLOR_CHART_LINE, width=2, smooth=True)
+            coords.extend([i * step_x, h - (val * scale_y) - 10])
+        if len(coords) >= 4: self.create_line(coords, fill=COLOR_CHART_LINE, width=2, smooth=True)
 
 class MonitorChannel(ctk.CTkFrame):
     def __init__(self, master, ch_id, **kwargs):
@@ -151,7 +138,8 @@ class MonitorChannel(ctk.CTkFrame):
         self.lbl_prog.pack(side="right")
 
     def activate(self, filename, tag):
-        self.lbl_title.configure(text=f"运行中: {filename[:20]}...", text_color=COLOR_ACCENT)
+        if not self.winfo_exists(): return
+        self.lbl_title.configure(text=f"运行中: {filename[:15]}...", text_color=COLOR_ACCENT)
         self.lbl_info.configure(text=tag, text_color="#AAA")
         self.lbl_fps.configure(text_color="#FFF")
         self.lbl_prog.configure(text_color=COLOR_ACCENT)
@@ -159,12 +147,14 @@ class MonitorChannel(ctk.CTkFrame):
         self.scope.clear()
 
     def update_data(self, fps, prog, eta):
+        if not self.winfo_exists(): return
         self.scope.add_point(fps)
         self.lbl_fps.configure(text=f"{fps}")
         self.lbl_prog.configure(text=f"{int(prog*100)}%")
         self.lbl_eta.configure(text=f"ETA: {eta}")
 
     def reset(self):
+        if not self.winfo_exists(): return
         self.lbl_title.configure(text="通道 · 空闲", text_color="#555")
         self.lbl_info.configure(text="等待任务...", text_color="#444")
         self.lbl_fps.configure(text="0", text_color="#333")
@@ -204,12 +194,13 @@ class UltraEncoderApp(DnDWindow):
     def __init__(self):
         super().__init__()
         
-        self.title("Ultra Encoder v35 - Logic Fixed & DnD Support")
+        self.title("Ultra Encoder v36 - Fixed Architecture")
         self.geometry("1300x900")
         self.configure(fg_color=COLOR_BG_MAIN)
         self.minsize(1200, 850) 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
+        # 核心数据
         self.file_queue = [] 
         self.task_widgets = {}
         self.active_procs = []
@@ -217,6 +208,7 @@ class UltraEncoderApp(DnDWindow):
         self.running = False
         self.stop_flag = False
         
+        # 锁
         self.queue_lock = threading.Lock() 
         self.slot_lock = threading.Lock()
         self.io_lock = threading.Lock() 
@@ -228,15 +220,17 @@ class UltraEncoderApp(DnDWindow):
         self.current_workers = 2
         self.temp_dir = ""
         
+        # 【核心修复】全局线程池，不再循环创建
+        self.executor = ThreadPoolExecutor(max_workers=4) 
+        
         self.setup_ui()
         self.after(200, self.sys_check)
         self.apply_system_priority("优先") 
         
         if HAS_DND:
             self.drop_target_register(DND_FILES)
-            self.dnd_bind('<<Drop>>', self.drop_file) # 💡 这里现在有函数实现了
+            self.dnd_bind('<<Drop>>', self.drop_file)
 
-    # === [修复] 补全拖拽函数实现 ===
     def drop_file(self, event):
         files = self.tk.splitlist(event.data)
         self.add_list(files)
@@ -265,6 +259,7 @@ class UltraEncoderApp(DnDWindow):
             if not messagebox.askokcancel("退出", "任务正在进行中，确定要退出？"): return
         self.stop_flag = True
         self.running = False
+        self.executor.shutdown(wait=False) # 立即关闭线程池
         for p in self.active_procs:
             try: p.terminate(); p.kill()
             except: pass
@@ -319,7 +314,7 @@ class UltraEncoderApp(DnDWindow):
         ctk.CTkLabel(rowP, text="系统性能模式", font=("微软雅黑", 12, "bold"), text_color="#DDD").pack(anchor="w")
         self.priority_var = ctk.StringVar(value="优先")
         self.seg_priority = ctk.CTkSegmentedButton(rowP, values=["常规", "优先", "极速"], 
-                                                  variable=self.priority_var, command=self.apply_system_priority,
+                                                  variable=self.priority_var, command=lambda v: self.apply_system_priority(v),
                                                   selected_color=COLOR_ACCENT, corner_radius=10)
         self.seg_priority.pack(fill="x", pady=(5, 0))
 
@@ -422,6 +417,7 @@ class UltraEncoderApp(DnDWindow):
                         try:
                             sz = os.path.getsize(target_file)
                             rb = 0
+                            # 读取并利用系统缓存，不保存内容
                             with open(target_file, 'rb') as f:
                                 while chunk := f.read(32*1024*1024): 
                                     rb += len(chunk)
@@ -438,6 +434,7 @@ class UltraEncoderApp(DnDWindow):
                     self.read_lock.release()
             else: time.sleep(1)
 
+    # === [关键修复] Engine 不再阻塞等待结果 ===
     def engine(self):
         while not self.stop_flag:
             tasks_to_run = []
@@ -452,14 +449,13 @@ class UltraEncoderApp(DnDWindow):
                             slots_free -= 1
             if not tasks_to_run:
                 time.sleep(0.5); continue
-            try:
-                with ThreadPoolExecutor(max_workers=self.current_workers) as pool:
-                    futures = [pool.submit(self.process, f) for f in tasks_to_run]
-                    for fut in futures:
-                        if self.stop_flag: break
-                        try: fut.result()
-                        except: pass
-            except: pass
+            
+            # 异步提交任务，不等待结果
+            for f in tasks_to_run:
+                self.executor.submit(self.process, f)
+            
+            time.sleep(0.1) # 短暂休息防止空转过快
+
         if not self.stop_flag:
             self.after(0, lambda: messagebox.showinfo("完成", "队列已全部搞定！"))
             self.running = False
@@ -476,11 +472,15 @@ class UltraEncoderApp(DnDWindow):
 
         card = self.task_widgets[input_file]
         is_ready = (card.status_code == STATUS_READY)
-        if not is_ready: self.read_lock.acquire() 
+        
+        # [关键修复] 锁逻辑重写：使用标志位确保只释放一次
+        lock_acquired = False
+        if not is_ready: 
+            self.read_lock.acquire()
+            lock_acquired = True
         
         try:
             if card.status_code in [STATUS_DONE, STATUS_MOVE]: 
-                if not is_ready and self.read_lock.locked(): self.read_lock.release()
                 with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
                 return
 
@@ -508,7 +508,12 @@ class UltraEncoderApp(DnDWindow):
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore', startupinfo=si)
                 self.active_procs.append(proc)
-                if not is_ready: time.sleep(3); self.read_lock.release() 
+                
+                # 延时释放读锁
+                if lock_acquired: 
+                    time.sleep(3)
+                    self.read_lock.release()
+                    lock_acquired = False 
                 
                 last_upd = 0
                 for line in proc.stdout:
@@ -529,14 +534,16 @@ class UltraEncoderApp(DnDWindow):
                 if proc in self.active_procs: self.active_procs.remove(proc)
                 success = (not self.stop_flag and proc.returncode == 0)
             except:
-                if not is_ready and self.read_lock.locked(): self.read_lock.release()
+                self.after(0, lambda: card.set_status("错误", COLOR_ERROR, STATUS_ERR))
 
             self.after(0, ch_ui.reset)
             with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
             if success:
                 threading.Thread(target=self.move_worker, args=(temp_out, final_out, card, os.path.getsize(input_file))).start()
-        except:
-            if not is_ready and self.read_lock.locked(): self.read_lock.release()
+        finally:
+            # 最终保障：如果锁还没释放，这里释放
+            if lock_acquired and self.read_lock.locked():
+                self.read_lock.release()
 
     def run(self):
         if not self.file_queue: return
@@ -555,7 +562,7 @@ class UltraEncoderApp(DnDWindow):
         with self.queue_lock:
             for f, card in self.task_widgets.items():
                 if card.status_code in [STATUS_RUN, STATUS_READ, STATUS_MOVE]:
-                    card.set_status("等待处理", COLOR_TEXT_GRAY, STATUS_WAIT)
+                    card.set_status("已停止", COLOR_TEXT_GRAY, STATUS_WAIT)
                     card.set_progress(0)
         self.running = False
         self.reset_ui_state()
@@ -565,6 +572,9 @@ class UltraEncoderApp(DnDWindow):
         try:
             self.after(0, lambda: [card.set_status("📦 移动中...", COLOR_MOVING, STATUS_MOVE), card.set_progress(0, COLOR_MOVING)])
             shutil.move(temp_out, final_out)
+            # [关键修复] 移动成功后，移除 temp_files
+            if temp_out in self.temp_files: self.temp_files.remove(temp_out)
+            
             new_sz = os.path.getsize(final_out)
             sv = 100 - (new_sz/orig_sz*100)
             if not self.stop_flag: self.after(0, lambda: [card.set_status(f"完成 | 压缩比: {sv:.1f}%", COLOR_SUCCESS, STATUS_DONE), card.set_progress(1, COLOR_SUCCESS)])
@@ -596,7 +606,9 @@ class UltraEncoderApp(DnDWindow):
     def get_dur(self, f):
         try:
             cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", f]
-            return float(subprocess.check_output(cmd, startupinfo=subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESHOWWINDOW)).strip())
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            return float(subprocess.check_output(cmd, startupinfo=si).strip())
         except: return 0
 
     def clean_junk(self):
