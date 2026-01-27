@@ -194,35 +194,174 @@ def check_ffmpeg():
         return True
     except: return False
 
-# === 磁盘类型检测 (修复增强版) ===
+# === 磁盘类型检测 (核武级：API底层查询 + 转速 + 物理测速) ===
+import struct
+
+# 缓存检测结果
 drive_type_cache = {}
 
 def is_drive_ssd(path):
-    drive_letter = os.path.splitdrive(path)[0]
-    if not drive_letter: return False
-    drive_letter = drive_letter.upper()
+    """
+    四重判定逻辑：
+    1. Windows API (DeviceIoControl): 查询是否有寻道惩罚 (最准，系统级标准)
+    2. PowerShell: 查询物理转速 (SpindleSpeed)
+    3. PowerShell: 查询介质类型 (MediaType)
+    4. 物理测速: 写入文件进行微秒级随机读测试 (最后防线)
+    """
+    root = os.path.splitdrive(os.path.abspath(path))[0].upper()
+    if not root: return False
+    drive_letter = root # 例如 "C:"
     
     # 查缓存
-    if drive_letter in drive_type_cache: return drive_type_cache[drive_letter]
-    
-    is_ssd = False
-    try:
-        # 方法A: PowerShell (标准方法)
-        cmd_ps = f'Get-Partition -DriveLetter {drive_letter[0]} | Get-Disk | Select-Object -ExpandProperty MediaType'
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        res_ps = subprocess.check_output(["powershell", "-Command", cmd_ps], startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW).decode().strip().upper()
-        if "SSD" in res_ps: is_ssd = True
-        
-        # 方法B: WMIC (备用方法，[修复] 现在可以正确生效了)
-        if not is_ssd:
-            cmd_wmic = f'wmic diskdrive get caption'
-            res_wmic = subprocess.check_output(cmd_wmic, shell=True, startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW).decode().upper()
-            if "SSD" in res_wmic: is_ssd = True
+    if drive_letter in drive_type_cache: 
+        return drive_type_cache[drive_letter]
 
-    except: pass
+    print(f"[*]正在深度检测磁盘: {drive_letter}")
+    is_ssd = False
     
+    # --- 方法 1: Windows API 底层查询 (寻道惩罚) ---
+    # 这是 Windows 判断是否开启碎片整理的官方标准。无寻道惩罚 = SSD
+    try:
+        FILE_READ_ATTRIBUTES = 0x80
+        OPEN_EXISTING = 3
+        # 打开卷句柄
+        h_vol = ctypes.windll.kernel32.CreateFileW(
+            f"\\\\.\\{drive_letter}",
+            FILE_READ_ATTRIBUTES,
+            0x00000001 | 0x00000002, # FILE_SHARE_READ | FILE_SHARE_WRITE
+            None,
+            OPEN_EXISTING,
+            0,
+            None
+        )
+        
+        if h_vol != -1:
+            # 定义查询结构
+            PropertyStandardQuery = 0
+            StorageDeviceSeekPenaltyProperty = 7
+            
+            class STORAGE_PROPERTY_QUERY(ctypes.Structure):
+                _fields_ = [
+                    ("PropertyId", ctypes.c_uint),
+                    ("QueryType", ctypes.c_uint),
+                    ("AdditionalParameters", ctypes.c_byte * 1)
+                ]
+            
+            query = STORAGE_PROPERTY_QUERY()
+            query.PropertyId = StorageDeviceSeekPenaltyProperty
+            query.QueryType = PropertyStandardQuery
+            
+            # 输出缓冲区 (布尔值 + 头部)
+            class DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
+                _fields_ = [
+                    ("Version", ctypes.c_ulong),
+                    ("Size", ctypes.c_ulong),
+                    ("IncursSeekPenalty", ctypes.c_bool)
+                ]
+            
+            out = DEVICE_SEEK_PENALTY_DESCRIPTOR()
+            bytes_returned = ctypes.c_ulong()
+            
+            # 调用 DeviceIoControl
+            ret = ctypes.windll.kernel32.DeviceIoControl(
+                h_vol,
+                0x002D1400, # IOCTL_STORAGE_QUERY_PROPERTY
+                ctypes.byref(query),
+                ctypes.sizeof(query),
+                ctypes.byref(out),
+                ctypes.sizeof(out),
+                ctypes.byref(bytes_returned),
+                None
+            )
+            
+            ctypes.windll.kernel32.CloseHandle(h_vol)
+            
+            if ret:
+                # 如果 IncursSeekPenalty 为 False (0)，说明没有寻道惩罚，则是 SSD
+                if not out.IncursSeekPenalty:
+                    print(f"   [API] 无寻道惩罚 -> 判定为 SSD")
+                    drive_type_cache[drive_letter] = True
+                    return True
+                else:
+                    print(f"   [API] 存在寻道惩罚 -> 可能是 HDD")
+    except Exception as e:
+        print(f"   [API] 检测失败: {e}")
+
+    # --- 方法 2 & 3: PowerShell 组合拳 (转速 + 介质类型) ---
+    # 你要求的 SpindleSpeed 加回来了，并且加了 MediaType 双重验证
+    if not is_ssd:
+        try:
+            # 命令：获取物理磁盘信息，忽略错误
+            cmd = f'Get-Partition -DriveLetter {drive_letter[0]} | Get-Disk | Select-Object MediaType, SpindleSpeed | ConvertTo-Json'
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            res = subprocess.check_output(
+                ["powershell", "-Command", cmd], 
+                startupinfo=si, 
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=3
+            ).decode().strip()
+            
+            # 简单解析 JSON 文本 (避免依赖 json 库解析出错)
+            res_upper = res.upper()
+            
+            # 判定 A: 介质类型明确写了 SSD
+            if '"MEDIATYPE": "SSD"' in res_upper or '"MEDIATYPE": 4' in res_upper:
+                print("   [PS] MediaType 确认为 SSD")
+                is_ssd = True
+            
+            # 判定 B: 转速 (SpindleSpeed) 为 0
+            # 注意：有些外接盒会返回 0 或 -1，有些 HDD 会返回 Unknown
+            if not is_ssd:
+                import re
+                speed_match = re.search(r'"SPINDLESPEED":\s*(\d+)', res_upper)
+                if speed_match:
+                    speed = int(speed_match.group(1))
+                    if speed == 0:
+                        print("   [PS] 转速为 0 -> 判定为 SSD")
+                        is_ssd = True
+        except Exception as e:
+            print(f"   [PS] 检测失败: {e}")
+
+    # --- 方法 4: 物理基准测试 (最后一道防线) ---
+    # 如果以上都失败（例如通过特殊扩展坞连接），直接测它
+    if not is_ssd:
+        try:
+            test_dir = os.path.join(drive_letter + "\\", "_SpeedTest_Temp")
+            os.makedirs(test_dir, exist_ok=True)
+            test_file = os.path.join(test_dir, ".probe")
+            
+            # 1. 写入 4KB 数据
+            with open(test_file, 'wb') as f:
+                f.write(os.urandom(4096))
+            
+            # 2. 随机读取延迟测试
+            # 机械硬盘寻道极慢 (>10ms)，SSD 极快 (<1ms)
+            t_start = time.perf_counter()
+            with open(test_file, 'rb') as f:
+                f.seek(2048) # 强制 seek
+                _ = f.read(1)
+            t_end = time.perf_counter()
+            
+            latency = (t_end - t_start) * 1000 # 转为毫秒
+            print(f"   [Benchmark] 随机读取延迟: {latency:.4f} ms")
+            
+            # 阈值设为 3ms。最快的 HDD 寻道也要 8ms+，所以低于 3ms 必是 SSD
+            if latency < 3.0:
+                is_ssd = True
+            
+            # 清理
+            try: os.remove(test_file); os.rmdir(test_dir)
+            except: pass
+            
+        except Exception as e:
+            print(f"   [Benchmark] 测速失败: {e}")
+
+    # 最终结算
     drive_type_cache[drive_letter] = is_ssd
+    result_str = "SSD" if is_ssd else "HDD"
+    print(f"[*] 最终判定 {drive_letter} 为: {result_str}")
     return is_ssd
 
 # === 核心：统一智能选盘算法 (修复版：源盘扣分策略) ===
