@@ -64,6 +64,37 @@ except ImportError:
     class DnDWindow(ctk.CTk): pass
     HAS_DND = False
 
+# === Windows 电源节流解除 (防最小化降速) ===
+class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+    _fields_ = [("Version", ctypes.c_ulong),
+                ("ControlMask", ctypes.c_ulong),
+                ("StateMask", ctypes.c_ulong)]
+
+def disable_power_throttling():
+    try:
+        # 禁止 Windows 将此进程判定为后台低功耗任务
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+        
+        ProcessPowerThrottling = 0x22
+        
+        state = PROCESS_POWER_THROTTLING_STATE()
+        state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        state.StateMask = 0 # 清零意味着：不节流，全速运行
+        
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ctypes.windll.kernel32.SetProcessInformation(
+            handle, 
+            ProcessPowerThrottling, 
+            ctypes.byref(state), 
+            ctypes.sizeof(state)
+        )
+        print("Power Throttling Disabled: OK")
+    except Exception as e:
+        print(f"Failed to disable throttling: {e}")
+
 class MEMORYSTATUSEX(ctypes.Structure):
     _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), 
                 ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong), 
@@ -250,18 +281,29 @@ class InfinityScope(ctk.CTkCanvas):
         w = self.winfo_width(); h = self.winfo_height()
         if w < 10 or h < 10: return
         n = len(self.points)
+        
+        # 获取当前数据最大值
         data_max = max(self.points) if self.points else 10
-        target_max = max(data_max, 10) * 1.1 
-        self.max_val += (target_max - self.max_val) * 0.1 
+        target_max = max(data_max, 10) * 1.1 # 留出 10% 顶部余量
+        
+        # [核心修复] 智能缩放算法
+        if target_max > self.max_val:
+            # 如果数据冲高，坐标轴立即跟进，防止线条画出界
+            self.max_val = target_max 
+        else:
+            # 如果数据回落，坐标轴缓慢收缩，保持视觉平滑
+            self.max_val += (target_max - self.max_val) * 0.05 
+            
         scale_y = (h - 20) / self.max_val
         self.create_line(0, h/2, w, h/2, fill="#2a2a2a", dash=(4,4))
+        
         if n < 2: return
         step_x = w / (n - 1)
         coords = []
         for i, val in enumerate(self.points):
             coords.extend([i * step_x, h - (val * scale_y) - 10])
+        
         if len(coords) >= 4:
-            # [优化] 增加 capstyle 和 joinstyle 以实现平滑抗锯齿效果
             self.create_line(coords, fill=COLOR_CHART_LINE, width=2, smooth=True, capstyle="round", joinstyle="round")
 
 class MonitorChannel(ctk.CTkFrame):
@@ -360,22 +402,36 @@ class UltraEncoderApp(DnDWindow):
     # [新增] 自动滚动到指定任务卡片
     def scroll_to_card(self, widget):
         try:
-            # 计算滚动位置 (简单估算)
+            # 强制刷新布局信息，确保坐标准确
             self.scroll.update_idletasks()
-            # 获取目标控件相对于滚动框顶部的坐标
-            y = widget.winfo_y()
-            # 获取滚动框内容的总高度
-            h = self.scroll.winfo_height() # 可视高度
-            content_h = self.scroll._parent_canvas.bbox("all")[3] # 内容总高度
             
-            if content_h > h:
-                pos = y / content_h
-                self.scroll._parent_canvas.yview_moveto(pos)
-        except: pass
+            # 获取画布对象
+            canvas = self.scroll._parent_canvas
+            
+            # 获取滚动内容的真实总高度 (bbox 3 是下边界坐标)
+            _, _, _, content_height = canvas.bbox("all")
+            
+            # 获取可视区域高度
+            view_height = self.scroll.winfo_height()
+            
+            if content_height > view_height:
+                # 获取目标卡片的 Y 坐标 (相对于内容顶部)
+                target_y = widget.winfo_y()
+                card_height = widget.winfo_height()
+                
+                # 计算目标位置：让卡片显示在可视区域的 1/3 处，而不是贴顶，视觉更舒适
+                target_pos = (target_y - view_height * 0.3) / content_height
+                
+                # 限制范围在 0.0 - 1.0 之间
+                target_pos = max(0.0, min(1.0, target_pos))
+                
+                canvas.yview_moveto(target_pos)
+        except Exception as e: 
+            print(f"Scroll Error: {e}")
     
     def __init__(self):
         super().__init__()
-        self.title("Ultra Encoder v46 - 修复版") # 中文标题
+        self.title("Ultra Encoder") # 中文标题
         self.geometry("1300x900")
         self.configure(fg_color=COLOR_BG_MAIN)
         self.minsize(1200, 850) 
@@ -401,6 +457,7 @@ class UltraEncoderApp(DnDWindow):
         self.temp_files = set()
         
         self.setup_ui()
+        disable_power_throttling()
         self.after(200, self.sys_check)
         
         if HAS_DND:
