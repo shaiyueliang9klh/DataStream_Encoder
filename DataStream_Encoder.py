@@ -617,7 +617,7 @@ class UltraEncoderApp(DnDWindow):
     def process(self, input_file):
         if self.stop_flag: return
         
-        # ... (获取线程槽位代码保持不变) ...
+        # === 获取线程槽位 ===
         my_slot_idx = None
         while my_slot_idx is None and not self.stop_flag:
             with self.slot_lock:
@@ -628,11 +628,11 @@ class UltraEncoderApp(DnDWindow):
         card = self.task_widgets[input_file]
         ch_ui = self.monitor_slots[my_slot_idx]
         
-        # ... (缓存等待逻辑保持不变) ...
+        # 等待缓存完成
         while card.status_code == STATUS_CACHING and not self.stop_flag: 
             time.sleep(0.5)
 
-        # ... (PENDING 处理逻辑保持不变) ...
+        # 确保缓存逻辑执行
         if card.source_mode == "PENDING":
             self.read_lock.acquire()
             try:
@@ -641,6 +641,7 @@ class UltraEncoderApp(DnDWindow):
             finally:
                 self.read_lock.release()
         
+        # [修复2] 停止时尽早退出，避免占用槽位不释放
         if self.stop_flag: 
             with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
             return
@@ -651,7 +652,6 @@ class UltraEncoderApp(DnDWindow):
         success = False
         output_log = []
         
-        # 定义变量存储服务器引用
         ram_server = None 
 
         while current_try <= max_retries and not self.stop_flag:
@@ -677,20 +677,16 @@ class UltraEncoderApp(DnDWindow):
             
             # === 构建输入源 ===
             input_arg = input_file
-            
-            # [关键修改] RAM 模式下启动 HTTP Server
             if card.source_mode == "RAM":
                 try:
-                    if not ram_server: # 防止重试时重复启动
+                    if not ram_server:
                         ram_server, port, _ = start_ram_server(card.ram_data)
-                    # 构造本地 URL
                     input_arg = f"http://127.0.0.1:{port}/video{ext}"
                     print(f"Memory Streaming at: {input_arg}")
                 except Exception as e:
                     print(f"Server Error: {e}")
-                    card.source_mode = "DIRECT" # 启动失败降级为直读
+                    card.source_mode = "DIRECT"
                     input_arg = input_file
-
             elif card.source_mode == "SSD_CACHE": 
                 input_arg = card.ssd_cache_path
             
@@ -706,45 +702,71 @@ class UltraEncoderApp(DnDWindow):
             else:
                 cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
             
-            cmd.extend(["-c:a", "copy", final_out])
+            # [修复1] 添加 -progress pipe:1 让FFmpeg输出机器可读日志，解决UI不显示问题
+            # 添加 -nostats 避免人类可读日志干扰
+            cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", final_out])
             
-            # 运行 FFmpeg
             dur_file = input_file 
             duration = self.get_dur(dur_file)
             
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            # 注意：HTTP模式不需要 stdin=PIPE
+            # 注意：使用了 -progress pipe:1 后，信息会流向 stdout
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si)
             self.active_procs.append(proc)
             
             start_t = time.time()
             last_upd = 0
             
+            # [修复1] 全新的日志解析逻辑
+            current_fps = 0
             for line in proc.stdout:
                 if self.stop_flag: break
                 try: 
                     line_str = line.decode('utf-8', errors='ignore').strip()
                     if line_str: output_log.append(line_str)
+                    
+                    # 解析 key=value 格式
+                    if "=" in line_str:
+                        key, value = line_str.split("=", 1)
+                        key = key.strip()
+                        value = value.strip()
+                        
+                        if key == "fps":
+                            try: current_fps = int(float(value))
+                            except: pass
+                            
+                        # out_time_us 是微秒，最精准
+                        elif key == "out_time_us":
+                            try:
+                                us = int(value)
+                                current_sec = us / 1000000.0
+                                if duration > 0:
+                                    prog = current_sec / duration
+                                    # 限制刷新频率，避免UI卡死
+                                    if time.time() - last_upd > 0.1:
+                                        elap = time.time() - start_t
+                                        eta_sec = (elap / prog - elap) if prog > 0.01 else 0
+                                        eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
+                                        
+                                        self.after(0, lambda p=prog: card.set_progress(p, COLOR_ACCENT))
+                                        self.after(0, lambda f=current_fps, p=prog, e=eta: ch_ui.update_data(f, p, e))
+                                        last_upd = time.time()
+                            except: pass
                 except: continue
-                
-                if "time=" in line_str and duration > 0:
-                    tm = re.search(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)", line_str)
-                    fm = re.search(r"fps=\s*(\d+)", line_str)
-                    if tm:
-                        h, m, s = map(float, tm.groups())
-                        prog = (h*3600 + m*60 + s) / duration
-                        if time.time() - last_upd > 0.1: 
-                            elap = time.time() - start_t
-                            eta = f"{int((elap/prog-elap)//60):02d}:{int((elap/prog-elap)%60):02d}" if prog > 0.01 else "--:--"
-                            self.after(0, lambda p=prog: card.set_progress(p, COLOR_ACCENT))
-                            self.after(0, lambda f=int(fm.group(1)) if fm else 0, p=prog, e=eta: ch_ui.update_data(f, p, e))
-                            last_upd = time.time()
             
             proc.wait()
             if proc in self.active_procs: self.active_procs.remove(proc)
             
+            # [修复2] 关键点：如果检测到停止标志，直接退出，不走下面的错误判定
+            if self.stop_flag: 
+                if ram_server: ram_server.shutdown(); ram_server.server_close()
+                card.clean_memory()
+                # 释放槽位
+                with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
+                return # 直接结束函数
+
             # 成功判定
             if proc.returncode == 0:
                 if os.path.exists(final_out) and os.path.getsize(final_out) > 500*1024:
@@ -753,7 +775,7 @@ class UltraEncoderApp(DnDWindow):
                 else:
                     output_log.append(f"[System Error] File too small: {final_out}")
             
-            # 失败处理：只尝试切CPU，不再切直读（因为HTTP模式已经模拟了直读）
+            # 失败处理
             if not success and using_gpu and current_try < max_retries:
                 output_log.append("[Auto-Fix] GPU failed. Switching to CPU.")
                 self.gpu_var.set(False)
@@ -765,7 +787,7 @@ class UltraEncoderApp(DnDWindow):
 
         # === 清理服务器 ===
         if ram_server:
-            ram_server.shutdown() # 关闭服务器
+            ram_server.shutdown() 
             ram_server.server_close()
 
         # === 收尾 ===
@@ -785,43 +807,17 @@ class UltraEncoderApp(DnDWindow):
              sv = 100 - (new_sz/orig_sz*100) if orig_sz > 0 else 0
              self.after(0, lambda: [card.set_status(f"完成 | 压缩率: {sv:.1f}%", COLOR_SUCCESS, STATUS_DONE), card.set_progress(1, COLOR_SUCCESS)])
         else:
-             self.after(0, lambda: card.set_status("失败 (点击看日志)", COLOR_ERROR, STATUS_ERR))
-             err_msg = "\n".join(output_log[-20:])
-             def show_err():
-                 messagebox.showerror(f"任务失败: {fname}", f"FFmpeg 报错日志 (最后20行):\n\n{err_msg}")
-             self.after(0, show_err)
+             # 如果不是用户手动停止，才弹窗报错
+             if not self.stop_flag:
+                 self.after(0, lambda: card.set_status("失败 (点击看日志)", COLOR_ERROR, STATUS_ERR))
+                 err_msg = "\n".join(output_log[-30:]) # 增加到30行以防万一
+                 def show_err():
+                     messagebox.showerror(f"任务失败: {fname}", f"FFmpeg 报错日志 (最后30行):\n\n{err_msg}")
+                 self.after(0, show_err)
 
         with self.queue_lock:
             if input_file in self.submitted_tasks: self.submitted_tasks.remove(input_file)
-    
 
-        # === 循环结束后的收尾 ===
-        card.clean_memory()
-        if card.ssd_cache_path:
-            try: 
-                os.remove(card.ssd_cache_path)
-                self.temp_files.remove(card.ssd_cache_path)
-            except: pass
-        
-        self.after(0, ch_ui.reset)
-        with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
-        
-        if success:
-             orig_sz = os.path.getsize(input_file)
-             new_sz = os.path.getsize(final_out)
-             sv = 100 - (new_sz/orig_sz*100) if orig_sz > 0 else 0
-             self.after(0, lambda: [card.set_status(f"完成 | 压缩率: {sv:.1f}%", COLOR_SUCCESS, STATUS_DONE), card.set_progress(1, COLOR_SUCCESS)])
-        else:
-             self.after(0, lambda: card.set_status("失败 (点击看日志)", COLOR_ERROR, STATUS_ERR))
-             # 生成错误报告
-             err_msg = "\n".join(output_log[-20:]) # 取最后20行
-             def show_err():
-                 messagebox.showerror(f"任务失败: {fname}", f"FFmpeg 报错日志 (最后20行):\n\n{err_msg}")
-             self.after(0, show_err)
-
-        with self.queue_lock:
-            if input_file in self.submitted_tasks: self.submitted_tasks.remove(input_file)
-            
     def run(self):
         if not self.file_queue: return
         self.running = True
