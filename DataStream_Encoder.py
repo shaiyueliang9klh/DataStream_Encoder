@@ -170,44 +170,60 @@ def is_drive_ssd(path):
     drive_type_cache[drive_letter] = is_ssd
     return is_ssd
 
-def get_force_ssd_dir():
-    # [修复] 修正了盘符遍历的方式，使用 os.path.exists("X:\\")
-    best = None
-    max_free = 0
-    
-    # 遍历所有可能的盘符
+# === 核心：统一智能选盘算法 ===
+def find_best_cache_drive(excluded_drive_letter=None):
+    # 获取所有可用盘符 (A-Z)
     drives = [f"{chr(i)}:\\" for i in range(65, 91) if os.path.exists(f"{chr(i)}:\\")]
     
-    # 第一轮：只找非C盘的SSD
-    for root in drives:
-        if root.upper().startswith("C"): continue
-        try:
-            if is_drive_ssd(root):
-                free = shutil.disk_usage(root).free
-                if free > max_free and free > 30*1024**3:
-                    max_free = free
-                    best = root
-        except: pass
-            
-    # 第二轮：如果找不到合适的非C盘SSD，再考虑C盘
-    if not best:
-        root_c = "C:\\"
-        if is_drive_ssd(root_c):
-             best = root_c
-        else:
-             # 实在没有SSD，就回退到剩余空间最大的任意盘
-             for root in drives:
-                if root.upper().startswith("C"): continue # 还是尽量避开C盘
-                try:
-                    free = shutil.disk_usage(root).free
-                    if free > max_free:
-                        max_free = free
-                        best = root
-                except: pass
-
-    if not best: best = "C:\\" 
+    candidates = [] # 格式: (分数, 剩余空间, 路径)
     
-    path = os.path.join(best, "_Ultra_Smart_Cache_")
+    for root in drives:
+        d_letter = os.path.splitdrive(root)[0].upper()
+        
+        # 1. 绝对排除规则
+        if excluded_drive_letter and d_letter == excluded_drive_letter.upper():
+            continue
+            
+        try:
+            # 2. 空间检查 (至少预留 15GB)
+            usage = shutil.disk_usage(root)
+            free_gb = usage.free / (1024**3)
+            if free_gb < 15: continue
+            
+            # 3. 评分系统
+            score = 0
+            is_system = (d_letter == "C:")
+            is_ssd_detected = is_drive_ssd(root)
+            
+            # 规则A: 只要不是系统盘，直接起飞 (为了保护C盘寿命)
+            if not is_system: 
+                score += 100
+            
+            # 规则B: 如果检测到是SSD，加分
+            if is_ssd_detected:
+                score += 50
+                
+            # 规则C: 系统盘如果是SSD，也给点分 (作为保底)
+            if is_system and is_ssd_detected:
+                score += 10
+                
+            candidates.append((score, usage.free, root))
+        except: pass
+    
+    # 4. 竞价排名: 先比分数(高优先)，分数相同比剩余空间(大优先)
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    
+    if candidates:
+        # 返回冠军盘符
+        return candidates[0][2]
+    else:
+        # 实在没得选，只能回退到 C 盘
+        return "C:\\"
+    
+def get_force_ssd_dir():
+    # 启动时不排除任何盘（因为还不知道源文件在哪），单纯找最好的盘
+    best_root = find_best_cache_drive(excluded_drive_letter=None)
+    path = os.path.join(best_root, "_Ultra_Smart_Cache_")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -703,7 +719,7 @@ class UltraEncoderApp(DnDWindow):
     def process(self, input_file):
         if self.stop_flag: return
         
-        # === 获取线程槽位 ===
+        # === 1. 获取线程槽位 ===
         my_slot_idx = None
         while my_slot_idx is None and not self.stop_flag:
             with self.slot_lock:
@@ -714,7 +730,7 @@ class UltraEncoderApp(DnDWindow):
         card = self.task_widgets[input_file]
         ch_ui = self.monitor_slots[my_slot_idx]
         
-        # [修复] 自动滚动到当前任务
+        # [功能] 自动滚动到当前任务
         self.after(0, lambda: self.scroll_to_card(card))
         
         # 等待缓存完成
@@ -734,87 +750,44 @@ class UltraEncoderApp(DnDWindow):
             with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
             return
 
-        # === 核心处理逻辑 ===
+        # === 2. 准备阶段 ===
         max_retries = 1 
         current_try = 0
         success = False
         output_log = []
         ram_server = None 
         
-        # [修复] 磁盘智能选择 v2.0
+        # [核心] 磁盘智能选择 v3.0 (统一算法)
         fname = os.path.basename(input_file)
         name, ext = os.path.splitext(fname)
         codec_sel = self.codec_var.get()
         suffix = "_H265" if "H.265" in codec_sel else "_H264"
         final_target_file = os.path.join(os.path.dirname(input_file), f"{name}{suffix}{ext}")
         
+        # 获取源文件所在盘符
         src_drive = os.path.splitdrive(os.path.abspath(input_file))[0].upper()
         
-        # 寻找缓存盘策略：
-        # 1. 必须不是源盘
-        # 2. 优先级：非C盘SSD > 非C盘(未知类型但空间大) > C盘SSD > C盘
-        best_cache_root = None
-        max_free = 0
-        
-        candidates = [] # (priority, free_space, path) priority越大越好
-        
-        # 遍历存在的盘符
-        drives = [f"{chr(i)}:\\" for i in range(65, 91) if os.path.exists(f"{chr(i)}:\\")]
-        
-        for root in drives:
-            d_letter = os.path.splitdrive(root)[0].upper()
-            if d_letter == src_drive: continue # 坚决不用源盘
-            
-            try:
-                free = shutil.disk_usage(root).free
-                if free < 20*1024**3: continue # 空间小于20G的不考虑
-                
-                is_ssd_confirmed = is_drive_ssd(root)
-                is_system = d_letter == "C:"
-                
-                # 评分逻辑
-                score = 0
-                if not is_system: score += 10 # 非系统盘 +10分
-                if is_ssd_confirmed: score += 5 # 确认SSD +5分
-                
-                candidates.append((score, free, root))
-            except: pass
-        
-        # 排序：先按分数降序，再按剩余空间降序
-        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        
-        if candidates:
-            best_cache_root = candidates[0][2] # 取第一名
-        else:
-            best_cache_root = "C:\\" # 没得选只能用C盘
-            
+        # 调用核心算法寻找最佳缓存盘 (排除源盘)
+        best_cache_root = find_best_cache_drive(excluded_drive_letter=src_drive)
         best_cache_dir = os.path.join(best_cache_root, "_Ultra_Smart_Cache_")
         os.makedirs(best_cache_dir, exist_ok=True)
         
-        # [修复] 实时更新UI上的缓存池位置显示
+        # [UI] 实时更新显示的缓存池位置
         self.after(0, lambda: self.btn_cache.configure(text=f"缓存池: {best_cache_dir}"))
         
-        # 决策写入路径
-        # 只有一种情况直写源盘：源盘被识别为 SSD 且 上面的逻辑没找到任何其他更好的非C盘
-        # (如果candidates为空，说明除了源盘和C盘没别的了)
-        is_src_ssd_detected = is_drive_ssd(src_drive + "\\")
-        
-        if is_src_ssd_detected and not candidates:
-            working_output_file = final_target_file
-            need_move_back = False
-        else:
-            # 只要找到了其他盘(candidates有值)，就强制用其他盘
-            temp_name = f"TEMP_{int(time.time())}_{name}{suffix}{ext}"
-            working_output_file = os.path.join(best_cache_dir, temp_name)
-            need_move_back = True
+        # 决策写入路径: 只要不是源盘，就走缓存 (分离IO策略)
+        temp_name = f"TEMP_{int(time.time())}_{name}{suffix}{ext}"
+        working_output_file = os.path.join(best_cache_dir, temp_name)
+        need_move_back = True
 
+        # === 3. 压制循环 ===
         while current_try <= max_retries and not self.stop_flag:
             output_log.clear()
             using_gpu = self.gpu_var.get()
             mode_label = {"DIRECT": "SSD直读", "RAM": "内存加速", "SSD_CACHE": "缓存加速"}.get(card.source_mode, "未知")
             
-            # [修复] 状态文案改为 "压制中"
-            status_text = f"▶️ 压制中"
+            # [UI] 状态文案优化
+            status_text = f"▶️ 压制中 ({mode_label})"
             if current_try > 0: status_text = f"⚠️ 重试中 (CPU)..."
             
             self.after(0, lambda: [card.set_status(status_text, COLOR_ACCENT, STATUS_RUN), card.set_progress(0, COLOR_ACCENT)])
@@ -823,7 +796,7 @@ class UltraEncoderApp(DnDWindow):
             gpu_flag = "NVENC" if using_gpu else "CPU"
             self.after(0, lambda: ch_ui.activate(fname, f"{tag} | {gpu_flag}"))
             
-            # === 构建输入源 ===
+            # 构建输入源
             input_arg = input_file
             if card.source_mode == "RAM":
                 try:
@@ -850,6 +823,7 @@ class UltraEncoderApp(DnDWindow):
             else:
                 cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
             
+            # 关键参数: 机器可读进度日志
             cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", working_output_file])
             
             dur_file = input_file 
@@ -861,7 +835,7 @@ class UltraEncoderApp(DnDWindow):
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si)
             self.active_procs.append(proc)
             
-            # 应用优先级
+            # 尝试应用优先级
             try:
                 p_val = {"常规": PRIORITY_NORMAL, "优先": PRIORITY_ABOVE, "极速": PRIORITY_HIGH}.get(self.priority_var.get(), PRIORITY_ABOVE)
                 h_sub = ctypes.windll.kernel32.OpenProcess(0x0100 | 0x0200, False, proc.pid)
@@ -873,6 +847,7 @@ class UltraEncoderApp(DnDWindow):
             start_t = time.time()
             last_upd = 0
             
+            # 日志解析
             current_fps = 0
             for line in proc.stdout:
                 if self.stop_flag: break
@@ -906,6 +881,7 @@ class UltraEncoderApp(DnDWindow):
             proc.wait()
             if proc in self.active_procs: self.active_procs.remove(proc)
             
+            # 停止检查
             if self.stop_flag: 
                 if ram_server: ram_server.shutdown(); ram_server.server_close()
                 card.clean_memory()
@@ -915,6 +891,7 @@ class UltraEncoderApp(DnDWindow):
                 with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
                 return 
 
+            # 成功判定
             if proc.returncode == 0:
                 if os.path.exists(working_output_file) and os.path.getsize(working_output_file) > 500*1024:
                     success = True
@@ -922,11 +899,13 @@ class UltraEncoderApp(DnDWindow):
                 else:
                     output_log.append(f"[System Error] File too small: {working_output_file}")
             
+            # 自动降级重试 (GPU -> CPU)
             if not success and using_gpu and current_try < max_retries:
                 output_log.append("[Auto-Fix] GPU failed. Switching to CPU.")
                 self.gpu_var.set(False)
                 current_try += 1
                 time.sleep(1)
+                # 清理失败的残留文件
                 if os.path.exists(working_output_file):
                     try: os.remove(working_output_file)
                     except: pass
@@ -934,8 +913,10 @@ class UltraEncoderApp(DnDWindow):
             else:
                 break 
 
+        # === 4. 收尾阶段 ===
         if ram_server: ram_server.shutdown(); ram_server.server_close()
 
+        # 搬运回写 (Move Back)
         if success and need_move_back:
             try:
                 self.after(0, lambda: card.set_status("📦 回写硬盘中...", COLOR_MOVING, STATUS_RUN))
@@ -954,6 +935,7 @@ class UltraEncoderApp(DnDWindow):
         self.after(0, ch_ui.reset)
         with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
         
+        # 最终状态更新
         if success:
              orig_sz = os.path.getsize(input_file)
              if os.path.exists(final_target_file):
