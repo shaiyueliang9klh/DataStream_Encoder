@@ -141,19 +141,45 @@ def check_ffmpeg():
     except: return False
 
 def get_force_ssd_dir():
-    drives = ["D", "E", "F", "G", "C"]
+    # 优先检测非系统盘
+    non_system_drives = ["D", "E", "F", "G", "H", "I", "Z"] 
     best = None
     max_free = 0
-    for d in drives:
+    
+    # 第一轮：只找非C盘的SSD
+    for d in non_system_drives:
         root = f"{d}:\\"
         if os.path.exists(root):
             try:
-                free = shutil.disk_usage(root).free
-                if free > max_free and free > 50*1024**3:
-                    max_free = free
-                    best = root
+                # 必须是SSD才考虑
+                if is_drive_ssd(root):
+                    free = shutil.disk_usage(root).free
+                    # 空间要够大 (比如大于30G)
+                    if free > max_free and free > 30*1024**3:
+                        max_free = free
+                        best = root
             except: pass
+            
+    # 第二轮：如果找不到合适的非C盘SSD，再考虑C盘（或其他非SSD但空间巨大的盘作为保底）
+    if not best:
+        root_c = "C:\\"
+        if is_drive_ssd(root_c):
+             best = root_c
+        else:
+             # 实在没有SSD，就回退到剩余空间最大的任意盘
+             all_drives = non_system_drives + ["C"]
+             for d in all_drives:
+                root = f"{d}:\\"
+                if os.path.exists(root):
+                    try:
+                        free = shutil.disk_usage(root).free
+                        if free > max_free:
+                            max_free = free
+                            best = root
+                    except: pass
+
     if not best: best = "C:\\" 
+    
     path = os.path.join(best, "_Ultra_Smart_Cache_")
     os.makedirs(path, exist_ok=True)
     return path
@@ -641,7 +667,6 @@ class UltraEncoderApp(DnDWindow):
             finally:
                 self.read_lock.release()
         
-        # [修复2] 停止时尽早退出，避免占用槽位不释放
         if self.stop_flag: 
             with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
             return
@@ -651,8 +676,29 @@ class UltraEncoderApp(DnDWindow):
         current_try = 0
         success = False
         output_log = []
-        
         ram_server = None 
+        
+        # [新增] 确定输出路径逻辑
+        fname = os.path.basename(input_file)
+        name, ext = os.path.splitext(fname)
+        codec_sel = self.codec_var.get()
+        suffix = "_H265" if "H.265" in codec_sel else "_H264"
+        
+        # 最终目标文件 (在原目录下)
+        final_target_file = os.path.join(os.path.dirname(input_file), f"{name}{suffix}{ext}")
+        
+        # 实际工作文件 (FFmpeg 写入的地方)
+        # 逻辑：如果源文件已经在SSD (DIRECT模式)，则直接写源盘。
+        # 否则 (源是HDD)，写到 self.temp_dir (SSD缓存池)，最后再移回去。
+        is_src_ssd = is_drive_ssd(input_file)
+        if is_src_ssd:
+            working_output_file = final_target_file
+            need_move_back = False
+        else:
+            # 写入到缓存盘，避免机械硬盘同时读写
+            temp_name = f"TEMP_ENC_{int(time.time())}_{name}{suffix}{ext}"
+            working_output_file = os.path.join(self.temp_dir, temp_name)
+            need_move_back = True
 
         while current_try <= max_retries and not self.stop_flag:
             output_log.clear()
@@ -665,15 +711,9 @@ class UltraEncoderApp(DnDWindow):
             
             self.after(0, lambda: [card.set_status(status_text, COLOR_ACCENT, STATUS_RUN), card.set_progress(0, COLOR_ACCENT)])
             
-            fname = os.path.basename(input_file)
-            name, ext = os.path.splitext(fname)
-            codec_sel = self.codec_var.get()
             tag = "HEVC" if "H.265" in codec_sel else "AVC"
             gpu_flag = "NVENC" if using_gpu else "CPU"
             self.after(0, lambda: ch_ui.activate(fname, f"{tag} | {gpu_flag}"))
-            
-            suffix = "_H265" if "H.265" in codec_sel else "_H264"
-            final_out = os.path.join(os.path.dirname(input_file), f"{name}{suffix}{ext}")
             
             # === 构建输入源 ===
             input_arg = input_file
@@ -702,9 +742,8 @@ class UltraEncoderApp(DnDWindow):
             else:
                 cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
             
-            # [修复1] 添加 -progress pipe:1 让FFmpeg输出机器可读日志，解决UI不显示问题
-            # 添加 -nostats 避免人类可读日志干扰
-            cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", final_out])
+            # 输出到工作路径 (SSD 或 源盘)
+            cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", working_output_file])
             
             dur_file = input_file 
             duration = self.get_dur(dur_file)
@@ -712,14 +751,13 @@ class UltraEncoderApp(DnDWindow):
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            # 注意：使用了 -progress pipe:1 后，信息会流向 stdout
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si)
             self.active_procs.append(proc)
             
             start_t = time.time()
             last_upd = 0
             
-            # [修复1] 全新的日志解析逻辑
+            # 日志解析
             current_fps = 0
             for line in proc.stdout:
                 if self.stop_flag: break
@@ -727,29 +765,23 @@ class UltraEncoderApp(DnDWindow):
                     line_str = line.decode('utf-8', errors='ignore').strip()
                     if line_str: output_log.append(line_str)
                     
-                    # 解析 key=value 格式
                     if "=" in line_str:
                         key, value = line_str.split("=", 1)
-                        key = key.strip()
-                        value = value.strip()
+                        key = key.strip(); value = value.strip()
                         
                         if key == "fps":
                             try: current_fps = int(float(value))
                             except: pass
-                            
-                        # out_time_us 是微秒，最精准
                         elif key == "out_time_us":
                             try:
                                 us = int(value)
                                 current_sec = us / 1000000.0
                                 if duration > 0:
                                     prog = current_sec / duration
-                                    # 限制刷新频率，避免UI卡死
                                     if time.time() - last_upd > 0.1:
                                         elap = time.time() - start_t
                                         eta_sec = (elap / prog - elap) if prog > 0.01 else 0
                                         eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
-                                        
                                         self.after(0, lambda p=prog: card.set_progress(p, COLOR_ACCENT))
                                         self.after(0, lambda f=current_fps, p=prog, e=eta: ch_ui.update_data(f, p, e))
                                         last_upd = time.time()
@@ -759,36 +791,49 @@ class UltraEncoderApp(DnDWindow):
             proc.wait()
             if proc in self.active_procs: self.active_procs.remove(proc)
             
-            # [修复2] 关键点：如果检测到停止标志，直接退出，不走下面的错误判定
             if self.stop_flag: 
                 if ram_server: ram_server.shutdown(); ram_server.server_close()
                 card.clean_memory()
-                # 释放槽位
+                # 停止时，如果产生了临时文件，记得清理
+                if need_move_back and os.path.exists(working_output_file):
+                    try: os.remove(working_output_file)
+                    except: pass
                 with self.slot_lock: self.available_indices.append(my_slot_idx); self.available_indices.sort()
-                return # 直接结束函数
+                return 
 
             # 成功判定
             if proc.returncode == 0:
-                if os.path.exists(final_out) and os.path.getsize(final_out) > 500*1024:
+                if os.path.exists(working_output_file) and os.path.getsize(working_output_file) > 500*1024:
                     success = True
                     break 
                 else:
-                    output_log.append(f"[System Error] File too small: {final_out}")
+                    output_log.append(f"[System Error] File too small: {working_output_file}")
             
-            # 失败处理
             if not success and using_gpu and current_try < max_retries:
                 output_log.append("[Auto-Fix] GPU failed. Switching to CPU.")
                 self.gpu_var.set(False)
                 current_try += 1
                 time.sleep(1)
+                # 失败重试前清理可能存在的半成品
+                if os.path.exists(working_output_file):
+                    try: os.remove(working_output_file)
+                    except: pass
                 continue
             else:
                 break 
 
         # === 清理服务器 ===
-        if ram_server:
-            ram_server.shutdown() 
-            ram_server.server_close()
+        if ram_server: ram_server.shutdown(); ram_server.server_close()
+
+        # === 搬运回写 (Move Back) ===
+        if success and need_move_back:
+            try:
+                self.after(0, lambda: card.set_status("📦 回写硬盘中...", COLOR_MOVING, STATUS_RUN))
+                # 使用 shutil.move 将 SSD 的成品移回 HDD
+                shutil.move(working_output_file, final_target_file)
+            except Exception as e:
+                success = False
+                output_log.append(f"[Move Error] Failed to move file back: {e}")
 
         # === 收尾 ===
         card.clean_memory()
@@ -803,14 +848,17 @@ class UltraEncoderApp(DnDWindow):
         
         if success:
              orig_sz = os.path.getsize(input_file)
-             new_sz = os.path.getsize(final_out)
-             sv = 100 - (new_sz/orig_sz*100) if orig_sz > 0 else 0
-             self.after(0, lambda: [card.set_status(f"完成 | 压缩率: {sv:.1f}%", COLOR_SUCCESS, STATUS_DONE), card.set_progress(1, COLOR_SUCCESS)])
+             # 获取最终文件大小
+             if os.path.exists(final_target_file):
+                 new_sz = os.path.getsize(final_target_file)
+                 sv = 100 - (new_sz/orig_sz*100) if orig_sz > 0 else 0
+                 self.after(0, lambda: [card.set_status(f"完成 | 压缩率: {sv:.1f}%", COLOR_SUCCESS, STATUS_DONE), card.set_progress(1, COLOR_SUCCESS)])
+             else:
+                 self.after(0, lambda: card.set_status("文件丢失", COLOR_ERROR, STATUS_ERR))
         else:
-             # 如果不是用户手动停止，才弹窗报错
              if not self.stop_flag:
                  self.after(0, lambda: card.set_status("失败 (点击看日志)", COLOR_ERROR, STATUS_ERR))
-                 err_msg = "\n".join(output_log[-30:]) # 增加到30行以防万一
+                 err_msg = "\n".join(output_log[-30:]) 
                  def show_err():
                      messagebox.showerror(f"任务失败: {fname}", f"FFmpeg 报错日志 (最后30行):\n\n{err_msg}")
                  self.after(0, show_err)
