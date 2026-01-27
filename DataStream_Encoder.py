@@ -29,7 +29,8 @@ COLOR_ACCENT = "#3B8ED0"
 COLOR_ACCENT_HOVER = "#36719f"
 COLOR_CHART_LINE = "#00E676"
 COLOR_TEXT_WHITE = "#FFFFFF"
-COLOR_TEXT_GRAY = "#888888" 
+COLOR_TEXT_GRAY = "#888888"
+COLOR_READY_RAM = "#00B894" # 薄荷绿 (内存就绪专用色)
 COLOR_SUCCESS = "#2ECC71" # 绿色 (就绪/完成)
 COLOR_MOVING = "#F1C40F"  # 金色 (移动/IO)
 COLOR_READING = "#9B59B6" # 紫色 (预读)
@@ -260,7 +261,8 @@ class InfinityScope(ctk.CTkCanvas):
         for i, val in enumerate(self.points):
             coords.extend([i * step_x, h - (val * scale_y) - 10])
         if len(coords) >= 4:
-            self.create_line(coords, fill=COLOR_CHART_LINE, width=2, smooth=True)
+            # [优化] 增加 capstyle 和 joinstyle 以实现平滑抗锯齿效果
+            self.create_line(coords, fill=COLOR_CHART_LINE, width=2, smooth=True, capstyle="round", joinstyle="round")
 
 class MonitorChannel(ctk.CTkFrame):
     def __init__(self, master, ch_id, **kwargs):
@@ -474,7 +476,7 @@ class UltraEncoderApp(DnDWindow):
         self.after(0, lambda: self.btn_cache.configure(text=f"缓存池: {path}"))
 
     def set_status_bar(self, text):
-        self.lbl_global_status.configure(text=f"状态: {text}")
+        pass # [修改] 界面元素已移除，此函数不再执行任何操作
 
     def setup_ui(self):
         self.grid_columnconfigure(0, weight=0, minsize=320) 
@@ -488,7 +490,7 @@ class UltraEncoderApp(DnDWindow):
         l_head = ctk.CTkFrame(left, fg_color="transparent")
         l_head.pack(fill="x", padx=20, pady=(25, 10))
         ctk.CTkLabel(l_head, text="ULTRA ENCODER", font=("Impact", 26), text_color="#FFF").pack(anchor="w")
-        ctk.CTkLabel(l_head, text="v46 // 4080稳定修复版", font=("Arial", 10), text_color=COLOR_ACCENT).pack(anchor="w")
+        # [删除] 删除了版本号副标题
         
         self.btn_cache = ctk.CTkButton(left, text="正在检测磁盘...", fg_color="#252525", hover_color="#333", 
                                      text_color="#AAA", font=("Consolas", 10), height=28, corner_radius=14, command=self.open_cache)
@@ -534,7 +536,7 @@ class UltraEncoderApp(DnDWindow):
         ctk.CTkLabel(row2, text="画质 (CRF/QP)", font=("微软雅黑", 12, "bold"), text_color="#DDD").pack(anchor="w")
         c_box = ctk.CTkFrame(row2, fg_color="transparent")
         c_box.pack(fill="x")
-        self.crf_var = ctk.IntVar(value=23) # [调整] H.264 默认推荐 23
+        self.crf_var = ctk.IntVar(value=23)
         ctk.CTkSlider(c_box, from_=0, to=51, variable=self.crf_var, progress_color=COLOR_ACCENT).pack(side="left", fill="x", expand=True)
         ctk.CTkLabel(c_box, textvariable=self.crf_var, width=25, font=("Arial", 12, "bold"), text_color=COLOR_ACCENT).pack(side="right")
         
@@ -565,8 +567,8 @@ class UltraEncoderApp(DnDWindow):
         r_head = ctk.CTkFrame(right, fg_color="transparent")
         r_head.pack(fill="x", padx=30, pady=(25, 10))
         ctk.CTkLabel(r_head, text="LIVE MONITOR", font=("Impact", 20), text_color="#333").pack(side="left")
-        self.lbl_global_status = ctk.CTkLabel(r_head, text="系统状态: 就绪", font=("微软雅黑", 11), text_color="#555")
-        self.lbl_global_status.pack(side="right")
+        # [删除] 删除了右侧状态栏文字 (self.lbl_global_status)
+        
         self.monitor_frame = ctk.CTkFrame(right, fg_color="transparent")
         self.monitor_frame.pack(fill="both", expand=True, padx=25, pady=(0, 25))
 
@@ -601,31 +603,19 @@ class UltraEncoderApp(DnDWindow):
         free_ram = get_free_ram_gb()
         available_for_cache = free_ram - SAFE_RAM_RESERVE
 
+        def process_caching(self, src_path, widget):
+        # ... (前面的代码保持不变) ...
+
         if available_for_cache > file_size_gb and file_size_gb < MAX_RAM_LOAD_GB:
-            # 设置紫色状态
-            self.after(0, lambda: [widget.set_status("📥 读取中...", COLOR_READING, STATUS_CACHING), widget.set_progress(0, COLOR_READING)])
+            self.after(0, lambda: [widget.set_status("📥 载入内存中...", COLOR_RAM, STATUS_CACHING), widget.set_progress(0, COLOR_RAM)])
             try:
-                # [核心修复] 分块读取，每读 64MB 更新一次进度
-                chunk_size = 64 * 1024 * 1024 
-                data_buffer = bytearray()
-                read_len = 0
-                
                 with open(src_path, 'rb') as f:
-                    while True:
-                        if self.stop_flag: return False
-                        chunk = f.read(chunk_size)
-                        if not chunk: break
-                        data_buffer.extend(chunk)
-                        read_len += len(chunk)
-                        
-                        if file_size > 0:
-                            prog = read_len / file_size
-                            self.after(0, lambda p=prog: widget.set_progress(p, COLOR_READING))
-                
-                widget.ram_data = bytes(data_buffer) # 转回不可变bytes
-                self.after(0, lambda: [widget.set_status("就绪 (内存加速)", COLOR_RAM, STATUS_READY), widget.set_progress(1, COLOR_RAM)])
+                    widget.ram_data = f.read() 
+                # [修改] 这里改用 COLOR_READY_RAM (薄荷绿) 以区分压制状态
+                self.after(0, lambda: [widget.set_status("就绪 (内存加速)", COLOR_READY_RAM, STATUS_READY), widget.set_progress(1, COLOR_READY_RAM)])
                 widget.source_mode = "RAM"
                 return True
+            
             except Exception as e: 
                 print(f"RAM Load Failed: {e}")
                 widget.clean_memory()
