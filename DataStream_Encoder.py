@@ -371,11 +371,37 @@ def is_bus_usb(path):
         ctypes.windll.kernel32.CloseHandle(h_vol)
         
         if ret:
-            # BusType 7 代表 USB
-            if out.BusType == 7: return True
+            # === 1. 协议白名单 ===
+            # BusType 7 = USB
+            # BusType 1 = SCSI (UASP协议的 USB/外接硬盘)
+            # BusType 13 = iSCSI (网络磁盘)
+            if out.BusType in [7, 1, 13]: 
+                return True
             
+            # === 2. 核心：通用可移动属性检查 ===
+            # 这行代码能抓出绝大多数雷电3/4硬盘盒，因为它们通常标记为 Removable
+            if out.RemovableMedia:
+                return True
+            
+            # === 3. 针对“固件伪装”的雷电/USB4 硬盘盒的绝杀补丁 ===
+            # 只有当它是 NVMe (17) 且 不是系统盘 (C盘) 时，才强制视为“外接”
+            # 作用：防止把内置副盘(D盘)误判，同时也宁可错杀(缓存加速)也不放过外接雷电
+            if out.BusType == 17: # NVMe
+                try:
+                    # 获取当前盘符 (例如 "E:")
+                    current_drive = os.path.splitdrive(os.path.abspath(path))[0].upper()
+                    # 获取系统盘符 (通常是 "C:")
+                    system_drive = os.getenv("SystemDrive", "C:").upper()
+                    
+                    # 如果是 NVMe 但不是系统盘 -> 判定为外接/副盘 -> 强制走缓存
+                    # (对于压制任务，副盘走内存缓存也是有益无害的)
+                    if current_drive != system_drive:
+                        # 你可以取消下面这行的注释来调试看看雷电盒是不是被它抓住了
+                        # print(f"[Debug] Detected Non-System NVMe ({current_drive}), treating as External.")
+                        return True
+                except: pass
+                
         return False
-    except: return False
 
 # === 核心：统一智能选盘算法 (修复版：源盘扣分策略) ===
 def find_best_cache_drive(source_drive_letter=None):
