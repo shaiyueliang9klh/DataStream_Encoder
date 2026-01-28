@@ -393,46 +393,56 @@ def get_force_ssd_dir():
 class InfinityScope(ctk.CTkCanvas):
     def __init__(self, master, **kwargs):
         super().__init__(master, bg=COLOR_PANEL_RIGHT, highlightthickness=0, **kwargs)
-        self.points = [] 
-        self.max_val = 10.0
-        self.bind("<Configure>", self.draw)
+        self.points = []
+        self.display_max = 10.0  # 当前显示的Y轴上限 (用于动画)
+        self.target_max = 10.0   # 目标的Y轴上限
+        self.bind("<Configure>", lambda e: self.draw())
+        # 启动独立渲染循环 (60FPS)
+        self.animate_loop()
+
     def add_point(self, val):
         self.points.append(val)
-        if len(self.points) > 100: self.points.pop(0) 
-        self.draw()
-    def clear(self):
-        self.points = []
-        self.max_val = 10.0
-        self.delete("all")
-    def draw(self, event=None):
-        self.delete("all")
-        if not self.points: return
-        w = self.winfo_width(); h = self.winfo_height()
-        if w < 10 or h < 10: return
-        n = len(self.points)
-        
-        # 获取当前数据最大值
-        data_max = max(self.points) if self.points else 10
-        target_max = max(data_max, 10) * 1.1 # 留出 10% 顶部余量
-        
-        # [核心修复] 智能缩放算法
-        if target_max > self.max_val:
-            # 如果数据冲高，坐标轴立即跟进，防止线条画出界
-            self.max_val = target_max 
-        else:
-            # 如果数据回落，坐标轴缓慢收缩，保持视觉平滑
-            self.max_val += (target_max - self.max_val) * 0.05 
+        if len(self.points) > 100: self.points.pop(0)
+        # 不再直接调用 draw，而是更新目标值，让 animate_loop 去追赶
+        current_data_max = max(self.points) if self.points else 10
+        self.target_max = max(current_data_max, 10) * 1.2  # 留出20%顶部余量
+
+    def animate_loop(self):
+        if self.winfo_exists():
+            # === 核心算法：缓动插值 (Lerp) ===
+            # 让显示值每次只向目标值移动 10% 的距离 -> 形成丝滑的减速效果
+            diff = self.target_max - self.display_max
+            if abs(diff) > 0.1:
+                self.display_max += diff * 0.1  # 0.1 是阻尼系数，越小越顺滑
+                self.draw() # 只有数值变化时才重绘
             
-        scale_y = (h - 20) / self.max_val
-        self.create_line(0, h/2, w, h/2, fill="#2a2a2a", dash=(4,4))
+            # 保持约 60FPS 的刷新率
+            self.after(16, self.animate_loop)
+
+    def draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 10 or h < 10 or not self.points: return
+
+        # 使用平滑过渡后的 display_max 进行绘图
+        scale_y = (h - 20) / self.display_max
         
+        # 画虚线中轴
+        self.create_line(0, h/2, w, h/2, fill="#2a2a2a", dash=(4, 4))
+
+        n = len(self.points)
         if n < 2: return
+        
         step_x = w / (n - 1)
         coords = []
         for i, val in enumerate(self.points):
-            coords.extend([i * step_x, h - (val * scale_y) - 10])
-        
+            x = i * step_x
+            y = h - (val * scale_y) - 10
+            coords.extend([x, y])
+
         if len(coords) >= 4:
+            # width=2, smooth=True 是关键
             self.create_line(coords, fill=COLOR_CHART_LINE, width=2, smooth=True, capstyle="round", joinstyle="round")
 
 class MonitorChannel(ctk.CTkFrame):
@@ -598,6 +608,60 @@ class UltraEncoderApp(DnDWindow):
         if HAS_DND:
             self.drop_target_register(DND_FILES)
             self.dnd_bind('<<Drop>>', self.drop_file)
+
+    # === 新增：颜色插值动画函数 ===
+    def animate_text_change(self, button, new_text, new_fg_color=None):
+        """让按钮文字通过 淡出 -> 切换 -> 淡入 实现丝滑过渡"""
+        
+        # 1. 定义颜色转换工具
+        def hex_to_rgb(hex_col):
+            hex_col = hex_col.lstrip('#')
+            return tuple(int(hex_col[i:i+2], 16) for i in (0, 2, 4))
+
+        def rgb_to_hex(rgb):
+            return '#%02x%02x%02x' % (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+        # 获取当前文字颜色 (默认黑色或配置色) 和 背景色 (模拟透明)
+        start_hex = button._text_color if hasattr(button, '_text_color') else "#000000"
+        if isinstance(start_hex, list) or isinstance(start_hex, tuple): start_hex = start_hex[1] # 取暗色模式颜色
+        
+        bg_hex = COLOR_ACCENT # 按钮当前的背景色，用于融合
+        target_text_hex = "#000000" # 最终文字颜色
+        
+        # 动画步骤
+        steps = 10
+        delay = 15 # ms
+
+        # 第一阶段：淡出 (文字色 -> 背景色)
+        c1 = hex_to_rgb(start_hex)
+        c2 = hex_to_rgb(bg_hex)
+        
+        def fade_out(step):
+            if step <= steps:
+                r = c1[0] + (c2[0] - c1[0]) * (step / steps)
+                g = c1[1] + (c2[1] - c1[1]) * (step / steps)
+                b = c1[2] + (c2[2] - c1[2]) * (step / steps)
+                try: button.configure(text_color=rgb_to_hex((r,g,b)))
+                except: pass
+                self.after(delay, lambda: fade_out(step + 1))
+            else:
+                # 切换文字和颜色
+                button.configure(text=new_text)
+                if new_fg_color: button.configure(fg_color=new_fg_color)
+                # 开始淡入
+                fade_in(0)
+
+        # 第二阶段：淡入 (背景色 -> 目标文字色)
+        def fade_in(step):
+            if step <= steps:
+                r = c2[0] + (c1[0] - c2[0]) * (step / steps)
+                g = c2[1] + (c1[1] - c2[1]) * (step / steps)
+                b = c2[2] + (c1[2] - c2[2]) * (step / steps)
+                try: button.configure(text_color=rgb_to_hex((r,g,b)))
+                except: pass
+                self.after(delay, lambda: fade_in(step + 1))
+        
+        fade_out(0)
 
     def drop_file(self, event):
         files = self.tk.splitlist(event.data)
@@ -1195,7 +1259,12 @@ class UltraEncoderApp(DnDWindow):
         if not self.file_queue: return
         self.running = True
         self.stop_flag = False
-        self.btn_run.configure(state="disabled", text="引擎运行中...")
+        
+        # === 修改：使用丝滑动画切换文字 ===
+        # 原代码: self.btn_run.configure(state="disabled", text="引擎运行中...")
+        self.btn_run.configure(state="disabled") # 先禁用防止连点
+        self.animate_text_change(self.btn_run, "▶ 压制进行中...") 
+        
         self.btn_stop.configure(state="normal")
         self.update_monitor_layout()
         threading.Thread(target=self.engine, daemon=True).start()
