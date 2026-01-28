@@ -741,36 +741,54 @@ class UltraEncoderApp(DnDWindow):
 
     def add_list(self, files):
         with self.queue_lock:
-            # 1. 先将新文件加入队列和字典
+            # 1. 预先计算现有文件的“规范化绝对路径”集合
+            # normpath 会把 C:/A/b.mp4 统一变成 C:\A\b.mp4，确保比对精准
+            existing_paths = set(os.path.normpath(os.path.abspath(f)) for f in self.file_queue)
+            
             new_added = False
+            skipped_count = 0 # 记录跳过的重复项
+
             for f in files:
-                if f not in self.file_queue and f.lower().endswith(('.mp4', '.mkv', '.mov', '.avi', '.ts', '.flv')):
+                # 获取待添加文件的规范化路径
+                f_norm = os.path.normpath(os.path.abspath(f))
+                
+                # === 核心去重逻辑 ===
+                # 如果规范化路径已存在，说明是完全相同的文件 -> 跳过
+                # 如果文件名相同但文件夹不同，路径字符串自然不同 -> 保留
+                if f_norm in existing_paths:
+                    skipped_count += 1
+                    continue
+                
+                # 扩展名检查
+                if f.lower().endswith(('.mp4', '.mkv', '.mov', '.avi', '.ts', '.flv')):
                     self.file_queue.append(f)
+                    existing_paths.add(f_norm) # 立即加入集合，防止本次拖入的一批文件里有重复
+                    
                     # 创建卡片 (序号先填0，稍后统一刷新)
                     if f not in self.task_widgets:
                         card = TaskCard(self.scroll, 0, f) 
                         self.task_widgets[f] = card
                     new_added = True
             
+            # (可选) 可以在控制台输出跳过信息，或者弹窗提示
+            if skipped_count > 0:
+                print(f"[System] 已智能过滤 {skipped_count} 个重复任务。")
+            
             if not new_added: return
 
             # 2. [核心功能] 按照文件大小排序 (从小到大)
-            # 辅助函数：获取文件大小 (字节)
             def get_file_size(path):
                 try: return os.path.getsize(path)
-                except: return float('inf') # 如果读取失败，放到最后
+                except: return float('inf') 
             
-            # 对 file_queue 进行原地排序
             self.file_queue.sort(key=get_file_size)
 
             # 3. 刷新 UI 列表顺序
             for i, f in enumerate(self.file_queue):
                 if f in self.task_widgets:
                     card = self.task_widgets[f]
-                    # 先解绑 (从界面移除但保留实例)，再重新 Pack (按新顺序添加)
                     card.pack_forget()
                     card.pack(fill="x", pady=4)
-                    # 更新左侧序号 (i+1)
                     card.update_index(i + 1)
 
     def apply_system_priority(self, level):
