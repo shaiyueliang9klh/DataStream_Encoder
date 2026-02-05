@@ -45,6 +45,8 @@ def get_free_vram_gb():
     except:
         return 999.0 # 无法检测时假设无限，避免误判
 
+
+
 TOTAL_RAM = get_total_ram_gb()
 MAX_RAM_LOAD_GB = max(4.0, TOTAL_RAM - 12.0) 
 SAFE_RAM_RESERVE = 6.0  
@@ -67,6 +69,7 @@ COLOR_SSD_CACHE = "#E67E22"
 COLOR_DIRECT  = "#1ABC9C" 
 COLOR_PAUSED = "#7f8c8d"  
 COLOR_ERROR = "#FF4757"   
+COLOR_TEXT_GRAY = "#333333"
 
 STATUS_WAIT = 0
 STATUS_CACHING = 1   
@@ -451,7 +454,7 @@ class UltraEncoderApp(DnDWindow):
 
     def __init__(self):
         super().__init__()
-        self.title("Ultra Encoder v68 (Stable & Protected)")
+        self.title("Ultra Encoder v70 (Concurrency Safe)") # 更新标题
         self.geometry("1300x900")
         self.configure(fg_color=COLOR_BG_MAIN)
         self.minsize(1200, 850) 
@@ -466,6 +469,14 @@ class UltraEncoderApp(DnDWindow):
         self.queue_lock = threading.Lock() 
         self.slot_lock = threading.Lock()
         self.read_lock = threading.Lock()
+        
+        # === [v70 补丁开始] ===
+        # 新增 GPU 并发逻辑锁
+        self.gpu_lock = threading.Lock()
+        self.gpu_active_count = 0
+        # 获取一次总显存即可（调用后面定义的方法）
+        self.total_vram_gb = self.get_total_vram_gb() 
+        # === [v70 补丁结束] ===
         
         self.monitor_slots = []
         self.available_indices = [] 
@@ -608,28 +619,35 @@ class UltraEncoderApp(DnDWindow):
         threading.Thread(target=self.gpu_monitor_loop, daemon=True).start()
         self.update_monitor_layout()
 
-    # [v68.1]: 动态显存预算检测
+    # [v70]: 获取总显存大小
+    def get_total_vram_gb(self):
+        try:
+            cmd = ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"]
+            si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            return float(subprocess.check_output(cmd, startupinfo=si, encoding="utf-8").strip()) / 1024.0
+        except: return 16.0 # 默认 16GB (4080)
+
+# [v70]: 基于逻辑计数的显存预判 (解决并发抢占问题)
     def should_use_gpu(self, codec_sel):
-        if not self.gpu_var.get():
-            return False
+        if not self.gpu_var.get(): return False
         
-        free_vram = get_free_vram_gb()
-        
-        # 估算单任务显存需求 (4K分辨率下估算)
-        # AV1 编码器通常比 HEVC/AVC 占用更多显存
-        task_cost = 3.0 # H.264
+        # 估算单任务显存需求
+        task_cost = 3.0
         if "AV1" in codec_sel: task_cost = 4.5
         elif "H.265" in codec_sel: task_cost = 3.8
         
-        # 安全缓冲 (GB)
-        safety_buffer = 2.0
+        # 预留给系统的显存 (GB)
+        system_reserve = 2.5
         
-        needed = task_cost + safety_buffer
-        
-        if free_vram < needed:
-            print(f"[VRAM Protection] Free: {free_vram:.1f}GB < Needed: {needed:.1f}GB. Fallback to CPU.")
-            return False
-        
+        with self.gpu_lock:
+            # 核心逻辑：(当前已运行的任务数 + 即将启动的这1个) * 单任务消耗
+            predicted_usage = (self.gpu_active_count + 1) * task_cost
+            
+            # 检查是否超标
+            if predicted_usage > (self.total_vram_gb - system_reserve):
+                print(f"[VRAM Semaphore] 预估: {predicted_usage:.1f}G > 上限: {self.total_vram_gb - system_reserve:.1f}G (Active: {self.gpu_active_count}). Fallback CPU.")
+                return False
+                
         return True
 
     def gpu_monitor_loop(self):
@@ -981,20 +999,26 @@ class UltraEncoderApp(DnDWindow):
             while current_try <= max_retries and not self.stop_flag:
                 output_log.clear()
                 
-                # [v68.1]: 使用更智能的动态显存检测
                 using_gpu = self.gpu_var.get()
                 if using_gpu:
                     if not self.should_use_gpu(codec_sel):
                         using_gpu = False
-                        self.safe_update(card.set_status, "⚠️ 显存不足，转CPU", COLOR_MOVING, STATUS_RUN)
+                        self.safe_update(card.set_status, "⚠️ 显存满，转CPU", COLOR_MOVING, STATUS_RUN)
                 
+                # [v70]: 如果决定用 GPU，立即增加计数器 (占位)
                 if using_gpu:
-                    decode_flags, strategy_log = self.get_smart_decode_args(input_file)
-                else:
-                    decode_flags = []
-                    strategy_log = "CPU (Manual/OOM Fallback)"
+                    with self.gpu_lock:
+                        self.gpu_active_count += 1
 
-                self.safe_update(card.set_status, f"▶️ {strategy_log}", COLOR_ACCENT, STATUS_RUN)
+                try: # 使用 try-finally 确保计数器归还
+                    
+                    if using_gpu:
+                        decode_flags, strategy_log = self.get_smart_decode_args(input_file)
+                    else:
+                        decode_flags = []
+                        strategy_log = "CPU (Manual/OOM Fallback)"
+
+                    self.safe_update(card.set_status, f"▶️ {strategy_log}", COLOR_ACCENT, STATUS_RUN)
 
                 input_arg_final = input_file
                 if card.source_mode == "RAM":
@@ -1049,6 +1073,7 @@ class UltraEncoderApp(DnDWindow):
                 si = subprocess.STARTUPINFO()
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 
+                # 启动进程
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si)
                 self.active_procs.append(proc)
                 
@@ -1097,32 +1122,39 @@ class UltraEncoderApp(DnDWindow):
                 
                 proc.wait()
                 if proc in self.active_procs: self.active_procs.remove(proc)
-                
-                if self.stop_flag: 
-                    if ram_server: ram_server.shutdown(); ram_server.server_close()
-                    card.clean_memory()
-                    if need_move_back and os.path.exists(working_output_file):
-                        try: os.remove(working_output_file)
-                        except: pass
-                    return 
 
-                if proc.returncode == 0:
-                    if os.path.exists(working_output_file) and os.path.getsize(working_output_file) > 500*1024:
-                        success = True
-                        break 
-                    else:
-                        output_log.append(f"[System Error] File too small: {working_output_file}")
+        finally:
+            # [v70]: 任务结束（无论成功失败），归还 GPU 计数
+            if using_gpu:
+                with self.gpu_lock:
+                    self.gpu_active_count -= 1
+                    if self.gpu_active_count < 0: self.gpu_active_count = 0
                 
-                if not success and using_gpu and current_try < max_retries:
-                    self.gpu_var.set(False) 
-                    current_try += 1
-                    time.sleep(1)
-                    if os.path.exists(working_output_file):
-                        try: os.remove(working_output_file)
-                        except: pass
-                    continue
-                else:
+            if self.stop_flag: 
+                if ram_server: ram_server.shutdown(); ram_server.server_close()
+                card.clean_memory()
+                if need_move_back and os.path.exists(working_output_file):
+                    try: os.remove(working_output_file)
+                    except: pass
+                return 
+
+            if proc.returncode == 0:
+                if os.path.exists(working_output_file) and os.path.getsize(working_output_file) > 500*1024:
+                    success = True
                     break 
+                else:
+                    output_log.append(f"[System Error] File too small: {working_output_file}")
+                
+            if not success and using_gpu and current_try < max_retries:
+                self.gpu_var.set(False) 
+                current_try += 1
+                time.sleep(1)
+                if os.path.exists(working_output_file):
+                    try: os.remove(working_output_file)
+                    except: pass
+                continue
+            else:
+                break 
 
             if ram_server: ram_server.shutdown(); ram_server.server_close()
 
@@ -1172,7 +1204,9 @@ class UltraEncoderApp(DnDWindow):
                     self.available_indices.sort()
 
     def run(self):
-        if not self.file_queue: return
+        if not self.file_queue: 
+            messagebox.showinfo("提示", "请先拖入或添加视频文件！")
+            return
         
         self.btn_run.configure(state="disabled") 
         self.animate_text_change(self.btn_run, f"压制中 (1/{len(self.file_queue)})") 
