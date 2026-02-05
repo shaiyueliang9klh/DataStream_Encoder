@@ -784,6 +784,8 @@ class UltraEncoderApp(DnDWindow):
         # 线程池：用于管理后台任务
         self.executor = ThreadPoolExecutor(max_workers=16) 
         self.submitted_tasks = set() 
+        self.preload_executor = ThreadPoolExecutor(max_workers=1) 
+        self.preloading_tasks = set() # 记录哪些文件正在预加载，防止重复提交
         self.temp_dir = ""
         self.manual_cache_path = None
         self.temp_files = set() # 临时文件列表，用于退出时清理
@@ -1278,12 +1280,77 @@ class UltraEncoderApp(DnDWindow):
             # 提交任务到线程池
             for f in tasks_to_run:
                 self.executor.submit(self.process, f)
+
+            # === 【修改 3】在这里插入预加载检查 ===
+            # 每次调度循环，都看看有没有空闲资源去偷跑后面的任务
+            self.check_and_preload()
+
             time.sleep(0.1) 
 
         if not self.stop_flag:
             self.safe_update(messagebox.showinfo, "完成", "所有任务已处理完毕！")
         self.running = False
         self.safe_update(self.reset_ui_state)
+
+    # === 【修改 2】新增：智能预加载检查函数 ===
+    def check_and_preload(self):
+        # 如果停止了，就不干活
+        if self.stop_flag: return
+
+        # 遍历文件队列，寻找下一个“值得预加载”的受害者
+        with self.queue_lock:
+            for f in self.file_queue:
+                # 1. 正在压制的，跳过
+                if f in self.submitted_tasks: continue
+                # 2. 正在预加载的，跳过
+                if f in self.preloading_tasks: continue
+                
+                card = self.task_widgets.get(f)
+                if not card: continue
+
+                # 3. 只有状态是“等待中”的才需要处理
+                # 如果已经是“就绪”或“完成”，跳过
+                if card.status_code != STATUS_WAIT: continue
+                
+                # === 核心逻辑 ===
+                # 检查内存是否足够容纳这个文件 (保留 3GB 安全线)
+                # 注意：这里只是粗略检查，process_caching 里面会有更严格的检查
+                try:
+                    f_size = os.path.getsize(f) / (1024**3) # GB
+                    free_ram = get_free_ram_gb()
+                    
+                    # 如果内存充裕，或者它是SSD（需要进去检测才知道），就提交给搬运工
+                    # 我们放宽一点限制，让 process_caching 去做最终判断
+                    if free_ram - 2.0 > f_size or is_drive_ssd(f): 
+                        self.preloading_tasks.add(f)
+                        self.preload_executor.submit(self.run_preload_task, f)
+                        # 为了保护机械硬盘，每次循环只提交一个预加载任务
+                        # 等这个搬完了，下一次循环再搬下一个
+                        return 
+                except: pass
+
+    # 这是搬运工具体干的活
+    def run_preload_task(self, input_file):
+        try:
+            if self.stop_flag: return
+            card = self.task_widgets[input_file]
+            
+            # 调用原本的缓存逻辑
+            # 注意：这个函数内部已经包含了 "如果是内置SSD -> return True (直读)" 的逻辑
+            # 所以这里不需要再写一遍 SSD 判断
+            self.read_lock.acquire() # 申请读取锁，避免和主压制任务抢硬盘
+            try:
+                self.process_caching(input_file, card)
+            finally:
+                self.read_lock.release()
+                
+        except Exception as e:
+            print(f"Preload Error: {e}")
+        finally:
+            # 搬运完了（或者判定是SSD不用搬），从名单里划掉
+            with self.queue_lock:
+                if input_file in self.preloading_tasks:
+                    self.preloading_tasks.remove(input_file)
 
     # --- 任务执行函数 (Process) ---
     # 这是一个工人，负责具体压制一个视频
