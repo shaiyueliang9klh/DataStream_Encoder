@@ -1116,7 +1116,8 @@ class UltraEncoderApp(DnDWindow):
             self.monitor_slots.append(ch)
 
     # --- 缓存处理核心逻辑 ---
-    def process_caching(self, src_path, widget):
+# --- [核心修复] 智能缓存函数：支持锁分离 ---
+    def process_caching(self, src_path, widget, lock_obj=None):
         file_size = os.path.getsize(src_path)
         file_size_gb = file_size / (1024**3)
         
@@ -1132,12 +1133,12 @@ class UltraEncoderApp(DnDWindow):
         # 2. 内存缓存判断：如果文件小于内存上限
         if file_size_gb < MAX_RAM_LOAD_GB:
              wait_count = 0
-             # 等待循环：如果内存不够，就等一会儿（防止队列堵塞）
-             while wait_count < 60: # 最多等30秒
+             # [重要修复] 等待内存时，千万不要持有 read_lock，否则会卡死主线程
+             while wait_count < 60: 
                  free_ram = get_free_ram_gb()
                  available = free_ram - SAFE_RAM_RESERVE
                  if available > file_size_gb:
-                     break # 内存够了，跳出循环去加载
+                     break 
                  
                  if wait_count == 0:
                      self.safe_update(widget.set_status, "⏳ 等待内存...", COLOR_WAITING, STATUS_WAIT)
@@ -1146,83 +1147,133 @@ class UltraEncoderApp(DnDWindow):
                  time.sleep(0.5)
                  wait_count += 1
 
-        # 再次检查内存是否足够（经过上面的等待后）
-        free_ram = get_free_ram_gb()
-        available_for_cache = free_ram - SAFE_RAM_RESERVE
-
-        if available_for_cache > file_size_gb and file_size_gb < MAX_RAM_LOAD_GB:
-            # === 进入内存加载流程 ===
-            self.safe_update(widget.set_status, "📥 载入内存中...", COLOR_RAM, STATUS_CACHING)
-            self.safe_update(widget.set_progress, 0, COLOR_RAM)
-            try:
-                chunk_size = 64 * 1024 * 1024 
-                data_buffer = bytearray()
-                read_len = 0
-                
-                with open(src_path, 'rb') as f:
-                    while True:
-                        if self.stop_flag: return False
-                        chunk = f.read(chunk_size)
-                        if not chunk: break
-                        data_buffer.extend(chunk) # 读入内存
-                        read_len += len(chunk)
-                        if file_size > 0:
-                            prog = read_len / file_size
-                            self.safe_update(widget.set_progress, prog, COLOR_READING)
-                
-                widget.ram_data = bytes(data_buffer) 
-                self.safe_update(widget.set_status, "就绪 (内存加速)", COLOR_READY_RAM, STATUS_READY)
-                self.safe_update(widget.set_progress, 1, COLOR_READY_RAM)
-                widget.source_mode = "RAM"
-                return True
-            except Exception: 
-                widget.clean_memory() # 失败则清理
-
-        # 3. 如果内存不够，就复制到SSD缓存盘
-        self.safe_update(widget.set_status, "📥 写入缓存...", COLOR_SSD_CACHE, STATUS_CACHING)
-        self.safe_update(widget.set_progress, 0, COLOR_SSD_CACHE)
+        # 3. 开始执行 IO 操作（此时才需要加锁）
+        # 如果传入了锁对象，在这里获取；否则假设外部已经获取了锁
+        if lock_obj: lock_obj.acquire()
         try:
-            fname = os.path.basename(src_path)
-            cache_path = os.path.join(self.temp_dir, f"CACHE_{int(time.time())}_{fname}")
-            copied = 0
-            with open(src_path, 'rb') as fsrc:
-                with open(cache_path, 'wb') as fdst:
-                    while True:
-                        if self.stop_flag: 
-                            fdst.close(); os.remove(cache_path); return False
-                        chunk = fsrc.read(32*1024*1024) 
-                        if not chunk: break
-                        fdst.write(chunk)
-                        copied += len(chunk)
-                        if file_size > 0:
-                            self.safe_update(widget.set_progress, copied/file_size, COLOR_SSD_CACHE)
-            self.temp_files.add(cache_path)
-            widget.ssd_cache_path = cache_path
-            widget.source_mode = "SSD_CACHE"
-            self.safe_update(widget.set_status, "就绪 (缓存加速)", COLOR_SSD_CACHE, STATUS_READY)
-            self.safe_update(widget.set_progress, 1, COLOR_SSD_CACHE)
-            return True
-        except:
-            self.safe_update(widget.set_status, "缓存失败", COLOR_ERROR, STATUS_ERR)
-            return False
+            # 再次检查内存（防止等待期间被别人抢了）
+            free_ram = get_free_ram_gb()
+            available_for_cache = free_ram - SAFE_RAM_RESERVE
+
+            if available_for_cache > file_size_gb and file_size_gb < MAX_RAM_LOAD_GB:
+                # === 进入内存加载流程 ===
+                self.safe_update(widget.set_status, "📥 载入内存中...", COLOR_RAM, STATUS_CACHING)
+                self.safe_update(widget.set_progress, 0, COLOR_RAM)
+                try:
+                    chunk_size = 64 * 1024 * 1024 
+                    data_buffer = bytearray()
+                    read_len = 0
+                    
+                    with open(src_path, 'rb') as f:
+                        while True:
+                            if self.stop_flag: return False
+                            chunk = f.read(chunk_size)
+                            if not chunk: break
+                            data_buffer.extend(chunk) 
+                            read_len += len(chunk)
+                            if file_size > 0:
+                                prog = read_len / file_size
+                                self.safe_update(widget.set_progress, prog, COLOR_READING)
+                    
+                    widget.ram_data = bytes(data_buffer) 
+                    self.safe_update(widget.set_status, "就绪 (内存加速)", COLOR_READY_RAM, STATUS_READY)
+                    self.safe_update(widget.set_progress, 1, COLOR_READY_RAM)
+                    widget.source_mode = "RAM"
+                    return True
+                except Exception: 
+                    widget.clean_memory() 
+
+            # 4. 如果内存不够，就复制到SSD缓存盘
+            self.safe_update(widget.set_status, "📥 写入缓存...", COLOR_SSD_CACHE, STATUS_CACHING)
+            self.safe_update(widget.set_progress, 0, COLOR_SSD_CACHE)
+            try:
+                fname = os.path.basename(src_path)
+                cache_path = os.path.join(self.temp_dir, f"CACHE_{int(time.time())}_{fname}")
+                copied = 0
+                with open(src_path, 'rb') as fsrc:
+                    with open(cache_path, 'wb') as fdst:
+                        while True:
+                            if self.stop_flag: 
+                                fdst.close(); os.remove(cache_path); return False
+                            chunk = fsrc.read(32*1024*1024) 
+                            if not chunk: break
+                            fdst.write(chunk)
+                            copied += len(chunk)
+                            if file_size > 0:
+                                self.safe_update(widget.set_progress, copied/file_size, COLOR_SSD_CACHE)
+                self.temp_files.add(cache_path)
+                widget.ssd_cache_path = cache_path
+                widget.source_mode = "SSD_CACHE"
+                self.safe_update(widget.set_status, "就绪 (缓存加速)", COLOR_SSD_CACHE, STATUS_READY)
+                self.safe_update(widget.set_progress, 1, COLOR_SSD_CACHE)
+                return True
+            except:
+                self.safe_update(widget.set_status, "缓存失败", COLOR_ERROR, STATUS_ERR)
+                return False
+        
+        finally:
+            if lock_obj: lock_obj.release()
             
     # 点击“启动”按钮触发
+# [核心修复] 启动函数：包含完整状态重置
     def run(self):
         if not self.file_queue: return
+        # 防止重复点击
+        if self.running: return
+
         self.running = True
         self.stop_flag = False
-        self.btn_run.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.btn_clear.configure(state="disabled")
-        self.gpu_active_count = 0 
         
-        # 启动调度引擎线程
+        # 1. UI 状态锁定
+        self.btn_run.configure(state="disabled")
+        self.btn_stop.configure(state="normal", text="停止")
+        self.btn_clear.configure(state="disabled")
+        
+        # 2. 重置线程池（防止旧任务僵死）
+        self.executor.shutdown(wait=False)
+        self.executor = ThreadPoolExecutor(max_workers=16)
+        self.preload_executor.shutdown(wait=False)
+        self.preload_executor = ThreadPoolExecutor(max_workers=1)
+        
+        # 3. 清理内部队列
+        self.submitted_tasks.clear()
+        self.preloading_tasks.clear()
+        self.gpu_active_count = 0
+        
+        # 4. 重置通道资源
+        with self.slot_lock:
+            self.available_indices = list(range(self.current_workers))
+        self.update_monitor_layout()
+
+        # 5. 重置未完成任务的状态 (Finished 的不动)
+        with self.queue_lock:
+            # 重新计算已完成数量
+            self.finished_tasks_count = 0
+            for f in self.file_queue:
+                card = self.task_widgets[f]
+                if card.status_code == STATUS_DONE:
+                    self.finished_tasks_count += 1
+                else:
+                    # 强制重置未完成的任务
+                    card.set_status("等待处理", "#888", STATUS_WAIT)
+                    card.set_progress(0)
+                    card.clean_memory() # 释放之前的内存缓存
+                    # 如果有之前的缓存文件，尽量删除（可选，不强求）
+                    if card.ssd_cache_path and os.path.exists(card.ssd_cache_path):
+                        try: os.remove(card.ssd_cache_path)
+                        except: pass
+                    card.ssd_cache_path = None
+                    card.source_mode = "PENDING"
+
+        # 6. 启动调度引擎
         threading.Thread(target=self.engine, daemon=True).start()
-    
-    # 点击“停止”按钮
+
+    # [配套修改] 停止函数
     def stop(self):
         self.stop_flag = True
-        self.btn_stop.configure(text="停止中...")
+        self.btn_stop.configure(text="正在停止...")
+        # 注意：不要在这里 executor.shutdown，否则 run 里的 shutdown 会报错或卡顿
+        # 让 worker 线程自己检测 stop_flag 退出即可
 
     # 重置界面状态（任务结束或停止后）
     def reset_ui_state(self):
@@ -1292,71 +1343,56 @@ class UltraEncoderApp(DnDWindow):
         self.running = False
         self.safe_update(self.reset_ui_state)
 
-    # === 【修改 2】新增：智能预加载检查函数 ===
-# === [修改 2] 智能预加载检查函数 (修复版：增加礼让逻辑) ===
+# [核心修复] 智能预加载检查
     def check_and_preload(self):
-        # 如果停止了，就不干活
         if self.stop_flag: return
 
         with self.queue_lock:
-            # --- [新增] 核心修复：礼让原则 ---
-            # 检查当前正在跑的任务(正规军)是否有人还在排队等硬盘
-            # 如果有“正规军”处于 等待(WAIT) 或 缓存中(CACHING) 的状态，
-            # 预加载线程必须立刻停止，把硬盘资源让给它们！
+            # --- 礼让原则 (优化版) ---
+            # 只有当正在跑的任务是“机械硬盘读取中”时，才暂停预加载。
+            # 如果正在跑的任务是 SSD 直读，或者是 内存读取，则允许预加载偷跑。
             for running_f in self.submitted_tasks:
                 running_card = self.task_widgets.get(running_f)
-                if running_card:
-                    # STATUS_WAIT=0, STATUS_CACHING=1
-                    # 只要状态 <= 1，说明它还没拿到数据，硬盘得留给它
-                    if running_card.status_code <= STATUS_CACHING:
-                        return 
-            # -------------------------------
-
-            # 如果正规军都已经在压制了(STATUS_RUN)，硬盘空闲了，我们再找下一个受害者
+                if running_card and running_card.status_code <= STATUS_CACHING:
+                    # 如果该文件在 SSD 上，允许并发读取，不退出
+                    if is_drive_ssd(running_f): continue
+                    # 否则（机械硬盘），必须礼让，防止磁头乱跳
+                    return 
+            
+            # 寻找下一个受害者
             for f in self.file_queue:
-                # 1. 正在压制的，跳过
                 if f in self.submitted_tasks: continue
-                # 2. 正在预加载的，跳过
                 if f in self.preloading_tasks: continue
                 
                 card = self.task_widgets.get(f)
                 if not card: continue
-
-                # 3. 只有状态是“等待中”的才需要处理
                 if card.status_code != STATUS_WAIT: continue
                 
-                # === 核心逻辑 ===
                 try:
-                    f_size = os.path.getsize(f) / (1024**3) # GB
+                    f_size = os.path.getsize(f) / (1024**3)
                     free_ram = get_free_ram_gb()
-                    
-                    # 检查内存 (保留 2GB 给系统) 或者是 SSD
+                    # 只要内存够，或者源文件在SSD上，就允许预加载
                     if free_ram - 2.0 > f_size or is_drive_ssd(f): 
                         self.preloading_tasks.add(f)
                         self.preload_executor.submit(self.run_preload_task, f)
-                        # 为了保护机械硬盘，每次循环只提交一个预加载任务
                         return 
                 except: pass
 
     # 这是搬运工具体干的活
+    # [核心修复] 预加载任务执行器
     def run_preload_task(self, input_file):
         try:
             if self.stop_flag: return
             card = self.task_widgets[input_file]
             
-            # 调用原本的缓存逻辑
-            # 注意：这个函数内部已经包含了 "如果是内置SSD -> return True (直读)" 的逻辑
-            # 所以这里不需要再写一遍 SSD 判断
-            self.read_lock.acquire() # 申请读取锁，避免和主压制任务抢硬盘
-            try:
-                self.process_caching(input_file, card)
-            finally:
-                self.read_lock.release()
+            # 这里的改动关键：不直接 acquire lock，而是把 lock 传进去
+            # 让 process_caching 在“等待内存”时不要锁硬盘，
+            # 只有在“真正读数据”时才锁硬盘。
+            self.process_caching(input_file, card, lock_obj=self.read_lock)
                 
         except Exception as e:
             print(f"Preload Error: {e}")
         finally:
-            # 搬运完了（或者判定是SSD不用搬），从名单里划掉
             with self.queue_lock:
                 if input_file in self.preloading_tasks:
                     self.preloading_tasks.remove(input_file)
@@ -1398,11 +1434,13 @@ class UltraEncoderApp(DnDWindow):
                 time.sleep(0.5)
 
             # 如果还没缓存（比如跳过了engine的预加载），这里补充缓存
+            # 在 process 函数里：
             if card.source_mode == "PENDING":
-                self.read_lock.acquire() # 读取锁，防止多个任务同时读硬盘导致卡顿
+                self.read_lock.acquire() 
                 try:
                     if card.source_mode == "PENDING" and not self.stop_flag:
-                       self.process_caching(input_file, card)
+                       # 这里不需要传 lock_obj，因为上面已经 acquire 了
+                       self.process_caching(input_file, card) 
                 finally:
                     self.read_lock.release()
             
