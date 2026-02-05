@@ -69,7 +69,6 @@ COLOR_SSD_CACHE = "#E67E22"
 COLOR_DIRECT  = "#1ABC9C" 
 COLOR_PAUSED = "#7f8c8d"  
 COLOR_ERROR = "#FF4757"   
-COLOR_TEXT_GRAY = "#333333"
 
 STATUS_WAIT = 0
 STATUS_CACHING = 1   
@@ -999,6 +998,7 @@ class UltraEncoderApp(DnDWindow):
             while current_try <= max_retries and not self.stop_flag:
                 output_log.clear()
                 
+                # [v68.1]: 使用更智能的动态显存检测
                 using_gpu = self.gpu_var.get()
                 if using_gpu:
                     if not self.should_use_gpu(codec_sel):
@@ -1011,7 +1011,6 @@ class UltraEncoderApp(DnDWindow):
                         self.gpu_active_count += 1
 
                 try: # 使用 try-finally 确保计数器归还
-                    
                     if using_gpu:
                         decode_flags, strategy_log = self.get_smart_decode_args(input_file)
                     else:
@@ -1020,141 +1019,145 @@ class UltraEncoderApp(DnDWindow):
 
                     self.safe_update(card.set_status, f"▶️ {strategy_log}", COLOR_ACCENT, STATUS_RUN)
 
-                input_arg_final = input_file
-                if card.source_mode == "RAM":
-                    try:
-                        if not ram_server:
-                            ram_server, port, _ = start_ram_server(card.ram_data)
-                        # [v68]: 使用 .mp4 后缀帮助 FFmpeg 识别
-                        input_arg_final = f"http://127.0.0.1:{port}/stream.mp4"
-                    except:
-                        input_arg_final = input_file
-                elif card.source_mode == "SSD_CACHE": 
-                    input_arg_final = card.ssd_cache_path
+                    input_arg_final = input_file
+                    if card.source_mode == "RAM":
+                        try:
+                            if not ram_server:
+                                ram_server, port, _ = start_ram_server(card.ram_data)
+                            # [v68]: 使用 .mp4 后缀帮助 FFmpeg 识别
+                            input_arg_final = f"http://127.0.0.1:{port}/stream.mp4"
+                        except:
+                            input_arg_final = input_file
+                    elif card.source_mode == "SSD_CACHE": 
+                        input_arg_final = card.ssd_cache_path
 
-                if using_gpu:
-                    if "H.265" in codec_sel: v_codec = "hevc_nvenc"
-                    elif "AV1" in codec_sel: v_codec = "av1_nvenc"
-                    else: v_codec = "h264_nvenc"
-                else:
-                    if "H.265" in codec_sel: v_codec = "libx265"
-                    elif "AV1" in codec_sel: v_codec = "libaom-av1"
-                    else: v_codec = "libx264"
+                    if using_gpu:
+                        if "H.265" in codec_sel: v_codec = "hevc_nvenc"
+                        elif "AV1" in codec_sel: v_codec = "av1_nvenc"
+                        else: v_codec = "h264_nvenc"
+                    else:
+                        if "H.265" in codec_sel: v_codec = "libx265"
+                        elif "AV1" in codec_sel: v_codec = "libaom-av1"
+                        else: v_codec = "libx264"
 
-                cmd = ["ffmpeg", "-y"]
-                cmd.extend(decode_flags)
-                cmd.extend(["-i", input_arg_final])
-                cmd.extend(["-c:v", v_codec])
-                
-                is_hw_decode = "-hwaccel" in decode_flags
-                
-                if using_gpu:
-                    if is_hw_decode:
-                        cmd.extend(["-vf", "scale_cuda=format=yuv420p"])
+                    cmd = ["ffmpeg", "-y"]
+                    cmd.extend(decode_flags)
+                    cmd.extend(["-i", input_arg_final])
+                    cmd.extend(["-c:v", v_codec])
+                    
+                    is_hw_decode = "-hwaccel" in decode_flags
+                    
+                    if using_gpu:
+                        if is_hw_decode:
+                            cmd.extend(["-vf", "scale_cuda=format=yuv420p"])
+                        else:
+                            cmd.extend(["-pix_fmt", "yuv420p"])
+                        
+                        # [v68]: AV1 参数修正 (-qp + P6)
+                        if "AV1" in codec_sel:
+                             cmd.extend(["-rc", "vbr", "-qp", str(self.crf_var.get()), 
+                                    "-preset", "p6", "-b:v", "0"]) 
+                        else:
+                            cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), 
+                                        "-preset", "p6", "-b:v", "0"])
                     else:
                         cmd.extend(["-pix_fmt", "yuv420p"])
+                        cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
                     
-                    # [v68]: AV1 参数修正 (-qp + P6)
-                    if "AV1" in codec_sel:
-                         cmd.extend(["-rc", "vbr", "-qp", str(self.crf_var.get()), 
-                                "-preset", "p6", "-b:v", "0"]) 
-                    else:
-                        cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), 
-                                    "-preset", "p6", "-b:v", "0"])
-                else:
-                    cmd.extend(["-pix_fmt", "yuv420p"])
-                    cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
-                
-                cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", working_output_file])
-                
-                dur_file = input_file 
-                duration = self.get_dur(dur_file)
-                
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                
-                # 启动进程
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si)
-                self.active_procs.append(proc)
-                
-                try:
-                    p_val = {"常规": PRIORITY_NORMAL, "优先": PRIORITY_ABOVE, "极速": PRIORITY_HIGH}.get(self.priority_var.get(), PRIORITY_ABOVE)
-                    h_sub = ctypes.windll.kernel32.OpenProcess(0x0100 | 0x0200, False, proc.pid)
-                    if h_sub:
-                        ctypes.windll.kernel32.SetPriorityClass(h_sub, p_val)
-                        disable_power_throttling(h_sub)
-                        ctypes.windll.kernel32.CloseHandle(h_sub)
-                except: pass
+                    cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", working_output_file])
+                    
+                    dur_file = input_file 
+                    duration = self.get_dur(dur_file)
+                    
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    
+                    # 启动进程
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si)
+                    self.active_procs.append(proc)
+                    
+                    try:
+                        p_val = {"常规": PRIORITY_NORMAL, "优先": PRIORITY_ABOVE, "极速": PRIORITY_HIGH}.get(self.priority_var.get(), PRIORITY_ABOVE)
+                        h_sub = ctypes.windll.kernel32.OpenProcess(0x0100 | 0x0200, False, proc.pid)
+                        if h_sub:
+                            ctypes.windll.kernel32.SetPriorityClass(h_sub, p_val)
+                            disable_power_throttling(h_sub)
+                            ctypes.windll.kernel32.CloseHandle(h_sub)
+                    except: pass
 
-                start_t = time.time()
-                last_ui_update_time = 0 
-                
-                current_fps = 0
-                for line in proc.stdout:
-                    if self.stop_flag: break
-                    try: 
-                        line_str = line.decode('utf-8', errors='ignore').strip()
-                        if line_str: output_log.append(line_str)
-                        
-                        if "=" in line_str:
-                            key, value = line_str.split("=", 1)
-                            key = key.strip(); value = value.strip()
+                    start_t = time.time()
+                    last_ui_update_time = 0 
+                    
+                    current_fps = 0
+                    for line in proc.stdout:
+                        if self.stop_flag: break
+                        try: 
+                            line_str = line.decode('utf-8', errors='ignore').strip()
+                            if line_str: output_log.append(line_str)
                             
-                            if key == "fps":
-                                try: current_fps = int(float(value))
-                                except: pass
-                            elif key == "out_time_us":
-                                try:
-                                    now = time.time()
-                                    if now - last_ui_update_time > 0.25: 
-                                        us = int(value)
-                                        current_sec = us / 1000000.0
-                                        if duration > 0:
-                                            prog = current_sec / duration
-                                            elap = now - start_t
-                                            eta_sec = (elap / prog - elap) if prog > 0.01 else 0
-                                            eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
-                                            self.safe_update(card.set_progress, prog, COLOR_ACCENT)
-                                            self.safe_update(ch_ui.update_data, current_fps, prog, eta)
-                                        last_ui_update_time = now
-                                except: pass
-                    except: continue
-                
-                proc.wait()
-                if proc in self.active_procs: self.active_procs.remove(proc)
+                            if "=" in line_str:
+                                key, value = line_str.split("=", 1)
+                                key = key.strip(); value = value.strip()
+                                
+                                if key == "fps":
+                                    try: current_fps = int(float(value))
+                                    except: pass
+                                elif key == "out_time_us":
+                                    try:
+                                        now = time.time()
+                                        if now - last_ui_update_time > 0.25: 
+                                            us = int(value)
+                                            current_sec = us / 1000000.0
+                                            if duration > 0:
+                                                prog = current_sec / duration
+                                                elap = now - start_t
+                                                eta_sec = (elap / prog - elap) if prog > 0.01 else 0
+                                                eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
+                                                self.safe_update(card.set_progress, prog, COLOR_ACCENT)
+                                                self.safe_update(ch_ui.update_data, current_fps, prog, eta)
+                                            last_ui_update_time = now
+                                    except: pass
+                        except: continue
+                    
+                    proc.wait()
+                    if proc in self.active_procs: self.active_procs.remove(proc)
 
-        finally:
-            # [v70]: 任务结束（无论成功失败），归还 GPU 计数
-            if using_gpu:
-                with self.gpu_lock:
-                    self.gpu_active_count -= 1
-                    if self.gpu_active_count < 0: self.gpu_active_count = 0
+                finally:
+                    # [v70]: 任务结束（无论成功失败），归还 GPU 计数
+                    if using_gpu:
+                        with self.gpu_lock:
+                            self.gpu_active_count -= 1
+                            if self.gpu_active_count < 0: self.gpu_active_count = 0
                 
-            if self.stop_flag: 
-                if ram_server: ram_server.shutdown(); ram_server.server_close()
-                card.clean_memory()
-                if need_move_back and os.path.exists(working_output_file):
-                    try: os.remove(working_output_file)
-                    except: pass
-                return 
+                # --- [修正点] 以下代码已移出 finally 块，并对齐到 while 循环 ---
+                
+                if self.stop_flag: 
+                    if ram_server: ram_server.shutdown(); ram_server.server_close()
+                    card.clean_memory()
+                    if need_move_back and os.path.exists(working_output_file):
+                        try: os.remove(working_output_file)
+                        except: pass
+                    return 
 
-            if proc.returncode == 0:
-                if os.path.exists(working_output_file) and os.path.getsize(working_output_file) > 500*1024:
-                    success = True
-                    break 
+                if proc.returncode == 0:
+                    if os.path.exists(working_output_file) and os.path.getsize(working_output_file) > 500*1024:
+                        success = True
+                        break 
+                    else:
+                        output_log.append(f"[System Error] File too small: {working_output_file}")
+                
+                if not success and using_gpu and current_try < max_retries:
+                    self.gpu_var.set(False) 
+                    current_try += 1
+                    time.sleep(1)
+                    if os.path.exists(working_output_file):
+                        try: os.remove(working_output_file)
+                        except: pass
+                    continue
                 else:
-                    output_log.append(f"[System Error] File too small: {working_output_file}")
-                
-            if not success and using_gpu and current_try < max_retries:
-                self.gpu_var.set(False) 
-                current_try += 1
-                time.sleep(1)
-                if os.path.exists(working_output_file):
-                    try: os.remove(working_output_file)
-                    except: pass
-                continue
-            else:
-                break 
+                    break 
+
+            # --- [修正点] 以下代码已移出 while 循环 ---
 
             if ram_server: ram_server.shutdown(); ram_server.server_close()
 
