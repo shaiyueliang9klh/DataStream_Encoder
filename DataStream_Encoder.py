@@ -580,7 +580,7 @@ class UltraEncoderApp(DnDWindow):
         os._exit(0)
         
     def kill_all_procs(self):
-        for p in self.active_procs:
+        for p in list(self.active_procs): # ✅ 安全：遍历列表的副本
             try: p.terminate(); p.kill()
             except: pass
         try: subprocess.run(["taskkill", "/F", "/IM", "ffmpeg.exe"], creationflags=subprocess.CREATE_NO_WINDOW)
@@ -929,16 +929,20 @@ class UltraEncoderApp(DnDWindow):
             using_gpu = self.gpu_var.get()
             mode_label = {"DIRECT": "SSD直读", "RAM": "内存加速", "SSD_CACHE": "缓存加速"}.get(card.source_mode, "未知")
             
-            # ... (在 process 函数内，while 循环里) ...
-            
             # [修改] 步骤 1: 智能判断解码方式
-            # 注意：如果是 RAM 模式，我们依然分析原文件(input_file)来决定解码策略，
-            # 因为数据流是一样的。
-            decode_flags, strategy_log = self.get_smart_decode_args(input_file)
+            using_gpu = self.gpu_var.get() # 先获取用户意图
             
-            # 更新 UI 显示当前解码策略，让用户知道
+            if using_gpu:
+                # 只有当用户允许使用 GPU 时，才启动智能硬解策略
+                decode_flags, strategy_log = self.get_smart_decode_args(input_file)
+            else:
+                # 如果用户强制关掉 GPU，则强制使用纯 CPU 解码
+                decode_flags = [] 
+                strategy_log = "CPU (Manual Forced)"
+
+            # 更新 UI
             self.after(0, lambda: card.set_status(f"▶️ {strategy_log}", COLOR_ACCENT, STATUS_RUN))
-            
+
             # [修改] 步骤 2: 构建输入源参数
             input_arg_final = input_file
             if card.source_mode == "RAM":
