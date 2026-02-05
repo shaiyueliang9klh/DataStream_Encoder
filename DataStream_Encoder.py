@@ -1293,12 +1293,26 @@ class UltraEncoderApp(DnDWindow):
         self.safe_update(self.reset_ui_state)
 
     # === 【修改 2】新增：智能预加载检查函数 ===
+# === [修改 2] 智能预加载检查函数 (修复版：增加礼让逻辑) ===
     def check_and_preload(self):
         # 如果停止了，就不干活
         if self.stop_flag: return
 
-        # 遍历文件队列，寻找下一个“值得预加载”的受害者
         with self.queue_lock:
+            # --- [新增] 核心修复：礼让原则 ---
+            # 检查当前正在跑的任务(正规军)是否有人还在排队等硬盘
+            # 如果有“正规军”处于 等待(WAIT) 或 缓存中(CACHING) 的状态，
+            # 预加载线程必须立刻停止，把硬盘资源让给它们！
+            for running_f in self.submitted_tasks:
+                running_card = self.task_widgets.get(running_f)
+                if running_card:
+                    # STATUS_WAIT=0, STATUS_CACHING=1
+                    # 只要状态 <= 1，说明它还没拿到数据，硬盘得留给它
+                    if running_card.status_code <= STATUS_CACHING:
+                        return 
+            # -------------------------------
+
+            # 如果正规军都已经在压制了(STATUS_RUN)，硬盘空闲了，我们再找下一个受害者
             for f in self.file_queue:
                 # 1. 正在压制的，跳过
                 if f in self.submitted_tasks: continue
@@ -1309,23 +1323,18 @@ class UltraEncoderApp(DnDWindow):
                 if not card: continue
 
                 # 3. 只有状态是“等待中”的才需要处理
-                # 如果已经是“就绪”或“完成”，跳过
                 if card.status_code != STATUS_WAIT: continue
                 
                 # === 核心逻辑 ===
-                # 检查内存是否足够容纳这个文件 (保留 3GB 安全线)
-                # 注意：这里只是粗略检查，process_caching 里面会有更严格的检查
                 try:
                     f_size = os.path.getsize(f) / (1024**3) # GB
                     free_ram = get_free_ram_gb()
                     
-                    # 如果内存充裕，或者它是SSD（需要进去检测才知道），就提交给搬运工
-                    # 我们放宽一点限制，让 process_caching 去做最终判断
+                    # 检查内存 (保留 2GB 给系统) 或者是 SSD
                     if free_ram - 2.0 > f_size or is_drive_ssd(f): 
                         self.preloading_tasks.add(f)
                         self.preload_executor.submit(self.run_preload_task, f)
                         # 为了保护机械硬盘，每次循环只提交一个预加载任务
-                        # 等这个搬完了，下一次循环再搬下一个
                         return 
                 except: pass
 
