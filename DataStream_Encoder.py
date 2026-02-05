@@ -608,24 +608,55 @@ class UltraEncoderApp(DnDWindow):
         threading.Thread(target=self.gpu_monitor_loop, daemon=True).start()
         self.update_monitor_layout()
 
+    # [v68.1]: 动态显存预算检测
+    def should_use_gpu(self, codec_sel):
+        if not self.gpu_var.get():
+            return False
+        
+        free_vram = get_free_vram_gb()
+        
+        # 估算单任务显存需求 (4K分辨率下估算)
+        # AV1 编码器通常比 HEVC/AVC 占用更多显存
+        task_cost = 3.0 # H.264
+        if "AV1" in codec_sel: task_cost = 4.5
+        elif "H.265" in codec_sel: task_cost = 3.8
+        
+        # 安全缓冲 (GB)
+        safety_buffer = 2.0
+        
+        needed = task_cost + safety_buffer
+        
+        if free_vram < needed:
+            print(f"[VRAM Protection] Free: {free_vram:.1f}GB < Needed: {needed:.1f}GB. Fallback to CPU.")
+            return False
+        
+        return True
+
     def gpu_monitor_loop(self):
         while not self.stop_flag:
             try:
-                cmd = ["nvidia-smi", "--query-gpu=power.draw,temperature.gpu", "--format=csv,noheader,nounits"]
+                # [v68.1]: 增加 memory.used 和 memory.total 监控
+                cmd = ["nvidia-smi", "--query-gpu=power.draw,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
                 si = subprocess.STARTUPINFO()
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 output = subprocess.check_output(cmd, encoding="utf-8", startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW).strip()
                 if output:
-                    p_str, t_str = output.split(",")
+                    p_str, t_str, m_used, m_total = output.split(",")
                     power = float(p_str)
                     temp = int(t_str)
+                    mem_used = float(m_used) / 1024
+                    mem_total = float(m_total) / 1024
+                    
                     color = "#555555"
-                    if temp > 75: color = COLOR_ERROR      
-                    elif temp > 60: color = COLOR_SSD_CACHE 
+                    if temp > 75 or mem_used > (mem_total * 0.9): color = COLOR_ERROR      
+                    elif temp > 60 or mem_used > (mem_total * 0.7): color = COLOR_SSD_CACHE 
                     elif power > 50: color = COLOR_SUCCESS  
-                    self.safe_update(self.lbl_gpu.configure, text=f"GPU: {power:.1f}W | {temp}°C", text_color=color)
+                    
+                    # 更新 UI 显示 VRAM
+                    status_text = f"GPU: {power:.0f}W | {temp}°C | VRAM: {mem_used:.1f}/{mem_total:.1f}G"
+                    self.safe_update(self.lbl_gpu.configure, text=status_text, text_color=color)
             except: pass
-            time.sleep(1) 
+            time.sleep(1)
 
     def scan_disk(self):
         path = find_best_cache_drive(manual_override=self.manual_cache_path)
@@ -950,12 +981,10 @@ class UltraEncoderApp(DnDWindow):
             while current_try <= max_retries and not self.stop_flag:
                 output_log.clear()
                 
+                # [v68.1]: 使用更智能的动态显存检测
                 using_gpu = self.gpu_var.get()
-
-                # [v68]: 显存看门狗
                 if using_gpu:
-                    free_vram = get_free_vram_gb()
-                    if free_vram < 2.5: # 预留 2.5GB 安全阈值
+                    if not self.should_use_gpu(codec_sel):
                         using_gpu = False
                         self.safe_update(card.set_status, "⚠️ 显存不足，转CPU", COLOR_MOVING, STATUS_RUN)
                 
