@@ -960,12 +960,30 @@ class UltraEncoderApp(DnDWindow):
             cmd.extend(["-i", input_arg_final])
             cmd.extend(["-c:v", v_codec])
             
-            # ... (后续参数保持不变: -pix_fmt yuv420p 等) ...
+            # === [核心优化 START] ===
+            # 这里的逻辑必须非常严密，否则会触发 "Impossible to convert" 错误
+            
+            # 1. 检查是否启用了硬件解码 (看 decode_flags 里有没有 -hwaccel)
+            is_hw_decode = "-hwaccel" in decode_flags
             
             if using_gpu:
-                cmd.extend(["-pix_fmt", "yuv420p", "-rc", "vbr", "-cq", str(self.crf_var.get()), 
+                if is_hw_decode:
+                    # 【全链路 GPU 模式】 (针对 HEVC / Canon H.264)
+                    # 数据全程在显存里：解码(CUDA) -> 转换(CUDA) -> 编码(NVENC)
+                    # 使用 scale_cuda 滤镜强制转为 yuv420p (兼容性最好)，零 CPU 占用！
+                    cmd.extend(["-vf", "scale_cuda=format=yuv420p"])
+                else:
+                    # 【混合模式】 (针对 Sony H.264 4:2:2)
+                    # 数据路径：CPU解码 -> 内存 -> 上传GPU编码
+                    # 这种情况下，必须用软件参数 -pix_fmt 指定格式
+                    cmd.extend(["-pix_fmt", "yuv420p"])
+                
+                # NVENC 编码参数
+                cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), 
                             "-preset", "p6", "-b:v", "0"])
             else:
+                # 【纯 CPU 模式】
+                cmd.extend(["-pix_fmt", "yuv420p"])
                 cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
             
             cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", working_output_file])
