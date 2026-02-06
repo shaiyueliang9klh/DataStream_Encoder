@@ -1,44 +1,81 @@
 # DataStream Encoder
 
-> 专为数字媒体创作者打造的自动化视频压制工具。
-> A minimalist, high-performance video encoding automation tool.
+<div align="left">
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.txt)
-[![Python 3.x](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/)
-[![Platform Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)]()
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)
+![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows)
+![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 
-**DataStream Encoder** 是一款基于 Python 和 FFmpeg 构建的现代化视频处理工具。它摒弃了繁琐的命令行参数，结合 `CustomTkinter` 的现代 UI 设计与底层系统优化，旨在提供“即拖即用”的流畅压制体验。
+**A Modern, High-Performance Automated Video Encoding Tool** **一款现代化的、高性能自动化视频压制工具**
 
-核心目标是解决创作流中繁琐的编码配置痛点，让技术更好地服务于艺术创作。
+[English](#-english) | [简体中文](#-简体中文)
 
-## ✨ 功能亮点 (Key Features)
+</div>
 
-* **⚡️ 零门槛环境部署 (Zero-Config Setup)**
-    * **智能依赖管理**：内置环境自检模块，自动检测并安装 `customtkinter`、`tkinterdnd2` 等必要库。
-    * **国内源加速**：自动识别网络环境，配置镜像源加速依赖下载，开箱即用。
+---
 
-* **🖱️ 极简交互流 (Minimalist Workflow)**
-    * **拖拽支持 (Drag & Drop)**：原生支持文件拖拽输入，告别传统的文件选择窗口。
-    * **现代化 UI**：基于深色模式设计的极简界面，专注内容，无干扰。
+## 📖 Introduction / 简介
 
-* **🛡️ 系统级稳定性保护 (System Stability)**
-    * **动态内存熔断**：通过 `GlobalMemoryStatusEx` 实时监控系统物理内存，智能计算安全阈值，防止高负载压制导致系统卡死。
-    * **功耗模式管理**：调用 Windows API (`ES_SYSTEM_REQUIRED`)，强制系统在渲染期间保持高性能运行，防止进入睡眠或“效率模式”降低编码速度。
+**DataStream Encoder** is a minimalist automation tool designed for digital media creators. Unlike traditional command-line tools, it offers a seamless **drag-and-drop** experience while harnessing the full power of FFmpeg.
 
-* **🎬 专业内核**
-    * 基于工业级标准的 **FFmpeg** 编码核心。
-    * 防御性编程设计，自动校验编解码器完整性。
+It features an intelligent **System Resource Governor**, ensuring that video encoding utilizes maximum performance without freezing your PC or interrupting your creative workflow.
 
-## 🛠️ 技术栈 (Tech Stack)
+**DataStream Encoder** 是专为数字媒体创作者设计的自动化工具。它在保留 FFmpeg 强大压制能力的同时，提供了极简的**拖拽交互**体验。内置智能**系统资源调度器**，确保在后台压制高画质视频时，既能跑满性能，又不会导致电脑卡顿。
 
-* **Language**: Python 3.10+
-* **GUI Framework**: CustomTkinter, TkinterDnD2
-* **Core Engine**: FFmpeg, FFprobe
-* **System Integration**: `ctypes` (Windows API access)
+---
 
-## 🚀 快速开始 (Quick Start)
+## ✨ Key Features / 核心功能
 
-### 1. 获取代码
-```bash
-git clone [https://github.com/shaiyueliang9klh/DataStream_Encoder.git](https://github.com/shaiyueliang9klh/DataStream_Encoder.git)
-cd DataStream_Encoder
+### 🚀 Smart Automation (智能自动化)
+- **Auto-Dependency Check**: Automatically detects and installs missing Python libraries (`tkinterdnd2`, `Pillow`, etc.) upon launch.
+- **FFmpeg Integration**: Checks for FFmpeg presence and guides configuration if missing.
+- **自动依赖管理**：启动时自动检测并安装缺失的第三方库，无需手动配置环境。
+
+### 🛡️ Hardware Safeguards (硬件保护)
+- **Dynamic RAM Management**: Calculates available physical memory in real-time (`GlobalMemoryStatusEx`) and limits buffer usage to prevent system OOM (Out of Memory) crashes.
+- **Power Throttling Control**: Uses Windows APIs (`SetThreadExecutionState`) to prevent the system from sleeping during long encoding tasks.
+- **动态内存调度**：实时计算物理内存余量，智能限制缓存大小，防止爆内存。
+- **功耗管理**：调用 Windows 底层 API 保持唤醒状态，防止长任务压制时电脑休眠。
+
+### 🖱️ Seamless Interaction (流畅交互)
+- **Drag & Drop Support**: Native file dragging support powered by `tkinterdnd2`.
+- **Modern UI**: Clean and minimalist interface tailored for efficiency.
+- **拖拽支持**：原生级的文件拖拽支持，无需繁琐的路径选择。
+
+---
+
+## 🛠️ Quick Start / 快速开始
+
+### Prerequisites (前置要求)
+- Windows 10 / 11
+- Python 3.10 or higher
+- FFmpeg (The script will guide you if it's missing)
+
+### Installation (安装与运行)
+
+1. **Clone the repository**
+   ```bash
+   git clone [https://github.com/shaiyueliang9klh/DataStream_Encoder.git](https://github.com/shaiyueliang9klh/DataStream_Encoder.git)
+   cd DataStream_Encoder
+2. **Run the script**
+   ```bash
+   python ultra_encoder.py
+
+---
+
+## 📂 Project Structure / 项目结构
+   ```Plaintext
+      DataStream_Encoder/
+      ├── ultra_encoder.py    # Main Application Logic (主程序)
+      ├── .gitignore          # Git Configuration
+      ├── LICENSE.txt         # MIT License
+      └── README.md           # Documentation
+
+---
+   
+## 📜 License / 许可证
+This project is licensed under the MIT License.
+
+本项目采用 MIT License 开源协议，您可以自由地使用、修改和分发。
+
+<div align="center"> Created with ❤️ by shaiyueliang9klh </div>
