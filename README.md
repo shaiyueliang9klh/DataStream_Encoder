@@ -1,4 +1,4 @@
-# DataStream Encoder
+# Cinetico Encoder
 
 <div align="left">
 
@@ -6,7 +6,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 ![AI](https://img.shields.io/badge/Co--Pilot-Gemini-8E75B2?style=flat-square)
-![Downloads](https://img.shields.io/github/downloads/shaiyueliang9klh/DataStream_Encoder/total?style=flat-square&color=orange)
+![Downloads](https://img.shields.io/github/downloads/shaiyueliang9klh/Cinetico_Encoder/total?style=flat-square&color=orange)
 
 **Queue-based Video Encoding Tool with GPU Acceleration / 支持GPU加速的队列化视频压制工具**
 
@@ -62,8 +62,8 @@ A queue-based video encoding tool **supporting GPU acceleration**. Powered by th
 
 1. **Clone the repository**
    ```bash
-   git clone [https://github.com/shaiyueliang9klh/DataStream_Encoder.git](https://github.com/shaiyueliang9klh/DataStream_Encoder.git)
-   cd DataStream_Encoder
+   git clone [https://github.com/shaiyueliang9klh/Cinetico_Encoder.git](https://github.com/shaiyueliang9klh/Cinetico_Encoder.git)
+   cd Cinetico_Encoder
 2. **Run the script**
    ```bash
    python ultra_encoder.py
@@ -74,7 +74,7 @@ A queue-based video encoding tool **supporting GPU acceleration**. Powered by th
  
 ## 📂 Project Structure / 项目结构
    ```Plaintext
-      DataStream_Encoder/
+      Cinetico_Encoder/
       ├── ultra_encoder.py    # Main Application Logic (主程序)
       ├── .gitignore          # Git Configuration
       ├── LICENSE.txt         # MIT License
