@@ -602,7 +602,7 @@ class HelpWindow(ctk.CTkToplevel):
         # =======================
         # 第二部分：编码格式
         # =======================
-        self.add_section_header("🎞️ 编码标准深度对标 (Codec)", "#00E676")
+        self.add_section_header("🎞️编码标准深度对标 (Codec)", "#00E676")
         self.add_tip("技术指标基于《2026全球视频编码技术全景报告》")
 
         codec_data = [
@@ -765,7 +765,7 @@ class UltraEncoderApp(DnDWindow):
     # --- 初始化函数：程序启动时执行这里 ---
     def __init__(self):
         super().__init__()
-        self.title("Cinético v75 (Stable Edition)")
+        self.title("Cinético_Encoder")
         self.geometry("1300x900")
         self.configure(fg_color=COLOR_BG_MAIN)
         self.minsize(1200, 850) 
@@ -1022,7 +1022,7 @@ class UltraEncoderApp(DnDWindow):
         
         title_box = ctk.CTkFrame(l_head, fg_color="transparent")
         title_box.pack(fill="x")
-        ctk.CTkLabel(title_box, text="Cinético", font=("Impact", 26), text_color="#FFF").pack(side="left")
+        ctk.CTkLabel(title_box, text="Cinético", font=("Segoe UI Black", 32), text_color="#FFF").pack(side="left")
         
         # 帮助按钮
         btn_help = ctk.CTkButton(title_box, text="❓", width=30, height=30, corner_radius=15, 
@@ -1107,7 +1107,8 @@ class UltraEncoderApp(DnDWindow):
         right.grid(row=0, column=1, sticky="nsew")
         r_head = ctk.CTkFrame(right, fg_color="transparent")
         r_head.pack(fill="x", padx=30, pady=(25, 10))
-        ctk.CTkLabel(r_head, text="LIVE MONITOR", font=("Impact", 20), text_color="#333").pack(side="left")
+        # [UI修复] 调亮文字颜色，使其可见
+        ctk.CTkLabel(r_head, text="LIVE MONITOR", font=("Microsoft YaHei UI", 20, "bold"), text_color="#BBB").pack(side="left")
         
         # 【新增】这里加一个 Label，专门用来显示任务队列状态
         self.lbl_run_status = ctk.CTkLabel(r_head, text="", font=("微软雅黑", 12, "bold"), text_color=COLOR_ACCENT)
@@ -1116,8 +1117,10 @@ class UltraEncoderApp(DnDWindow):
         self.lbl_gpu = ctk.CTkLabel(r_head, text="GPU: --W | --°C", font=("Consolas", 14, "bold"), text_color="#444")
         self.lbl_gpu.pack(side="right")
         
-        self.monitor_frame = ctk.CTkFrame(right, fg_color="transparent")
-        self.monitor_frame.pack(fill="both", expand=True, padx=25, pady=(0, 25))
+        # [UI修复] 改用 ScrollableFrame，防止任务多了显示不下
+        self.monitor_frame = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        # 修改 padding：底部留空稍微改小一点，给滚动条留位置
+        self.monitor_frame.pack(fill="both", expand=True, padx=25, pady=(0, 15))
 
     # 清空列表
     def clear_all(self):
@@ -1126,7 +1129,7 @@ class UltraEncoderApp(DnDWindow):
         self.task_widgets.clear()
         self.file_queue.clear()
         self.finished_tasks_count = 0
-        self.btn_run.configure(text="启动引擎")
+        self.btn_action.configure(text="COMPRESS / 启动")
 
     # 更新右侧监控窗口的布局（根据并发数增减）
     def update_monitor_layout(self, val=None, force_reset=False):
@@ -1257,10 +1260,11 @@ class UltraEncoderApp(DnDWindow):
         self.stop_flag = False
         
         # 【修改】按钮文字固定显示 STOP，不再显示进度
+        # [UI修复] 使用低调的暗红色，不再抢眼
         self.btn_action.configure(
-            text="STOP / 停止",  # 明确告知用户可以停止
-            fg_color=COLOR_ERROR, 
-            hover_color="#C0392B",
+            text="STOP / 停止",  
+            fg_color="#852222",  # 深暗红，既有警示作用又不刺眼
+            hover_color="#A32B2B", # 悬停时稍微亮一点
             state="normal"
         )
         self.btn_clear.configure(state="disabled")
@@ -1339,26 +1343,26 @@ class UltraEncoderApp(DnDWindow):
 
     # --- 调度引擎 (Engine) ---
     # 这个函数是总指挥，负责不断地从队列里拿任务给 process 函数去跑
+    # [核心修复] 增加防抢跑逻辑
     def engine(self):
         while not self.stop_flag:
             tasks_to_run = []
-            active_count = len(self.submitted_tasks) # 当前正在跑的数量
-            slots_free = self.current_workers - active_count # 剩余空位
+            active_count = len(self.submitted_tasks) 
+            slots_free = self.current_workers - active_count
             
-            # 如果有空位，去队列里找任务
+            # 1. 填充空闲槽位
             if slots_free > 0:
                 with self.queue_lock:
                     for f in self.file_queue:
                         if slots_free <= 0: break
-                        if f in self.submitted_tasks: continue # 已经提交过的跳过
+                        if f in self.submitted_tasks: continue 
                         card = self.task_widgets[f]
-                        # 只有处于"等待"或"就绪"状态的才能跑
                         if card.status_code in [STATUS_WAIT, STATUS_CACHING, STATUS_READY]:
                             tasks_to_run.append(f)
                             self.submitted_tasks.add(f)
                             slots_free -= 1
             
-            # 检查是否所有任务都做完了
+            # 检查是否全部完成
             if not tasks_to_run and active_count == 0 and self.file_queue:
                 all_done = True
                 with self.queue_lock:
@@ -1367,15 +1371,18 @@ class UltraEncoderApp(DnDWindow):
                             all_done = False; break
                 if all_done: break
             
-            if not tasks_to_run: 
-                time.sleep(0.2); continue # 没任务就休息一下
-            
-            # 提交任务到线程池
-            for f in tasks_to_run:
-                self.executor.submit(self.process, f)
+            # 2. 提交任务到线程池
+            if tasks_to_run:
+                for f in tasks_to_run:
+                    self.executor.submit(self.process, f)
+                
+                # 【关键修复点】
+                # 如果这轮刚启动了新任务，强制休息0.5秒，并跳过预加载检查！
+                # 这能确保任务1、2完全启动并占住位置后，才轮得到任务3
+                time.sleep(0.5) 
+                continue 
 
-            # === 【修改 3】在这里插入预加载检查 ===
-            # 每次调度循环，都看看有没有空闲资源去偷跑后面的任务
+            # 3. 只有在没有新任务启动时，才检查预加载
             self.check_and_preload()
 
             time.sleep(0.1) 
