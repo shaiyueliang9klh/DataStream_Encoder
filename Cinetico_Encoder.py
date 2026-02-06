@@ -1692,33 +1692,44 @@ class UltraEncoderApp(DnDWindow):
         
                         # 只在检测到特定关键标识时才进行复杂的字符串分割
                         if "=" in line_str:
-                            parts = dict(item.split("=") for item in line_str.split() if "=" in item)
+                                    # 1. 解析 FFmpeg 的进度键值对
+                                    parts = dict(item.split("=") for item in line_str.split() if "=" in item)
             
-                            # 频率控制：由之前的 0.2s 稍微放宽到 0.3s，降低 UI 刷新对主线程的锁定
-                            now = time.time()
-                            if now - last_ui_update_time > 0.3: # 每0.3秒更新一次界面
-                                us = int(value)
-                                current_sec = us / 1000000.0
-                                if duration > 0:
-                                    prog = current_sec / duration
-                                    elap = now - start_t
-                                    # 计算剩余时间 (ETA)
-                                    eta_sec = (elap / prog - elap) if prog > 0.01 else 0
-                                    eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
-                                    # 更新UI
-                                    self.safe_update(card.set_progress, prog, COLOR_ACCENT)
-                                    self.safe_update(ch_ui.update_data, current_fps, prog, eta)
-                                last_ui_update_time = now
-
-                                # [新增] 实时计算当前压缩率
-                                try:
-                                    out_size = os.path.getsize(working_output_file)
-                                    # 公式：(当前输出大小 / (原文件大小 * 进度百分比)) * 100
-                                    current_ratio = (out_size / (input_size * prog)) * 100 if prog > 0.01 else 0
-                                except: current_ratio = 0
-                                
-                                self.safe_update(ch_ui.update_data, current_fps, prog, eta, current_ratio)
-                                last_ui_update_time = now
+                                    # 2. 实时抓取 FPS（虽然你 CPU 很强，但看着数值跳动才爽）
+                                    current_fps = int(float(parts.get("fps", 0)))
+            
+                                    now = time.time()
+                                    if now - last_ui_update_time > 0.3: # 每 0.3 秒更新一次界面
+                                        # 【修正点】：从 parts 字典中获取微秒值
+                                        us_str = parts.get("out_time_us", "0")
+                                        us = int(us_str)
+                                        current_sec = us / 1000000.0
+                
+                                        # 初始化默认值，防止 duration 为 0 时后面报错
+                                        prog = 0
+                                        eta = "--:--"
+                
+                                        if duration > 0:
+                                            prog = current_sec / duration
+                                            elap = now - start_t
+                                            # 计算剩余时间 (ETA)
+                                            if prog > 0.001:
+                                                eta_sec = (elap / prog - elap)
+                                                eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
+                
+                                        # 实时计算当前压缩率
+                                        try:
+                                            out_size = os.path.getsize(working_output_file)
+                                            # 公式：当前输出大小 / (原文件大小 * 进度)
+                                            current_ratio = (out_size / (input_size * prog)) * 100 if prog > 0.01 else 0
+                                        except: 
+                                            current_ratio = 0
+                
+                                        # 统一更新 UI，不需要重复调用两次 safe_update
+                                        self.safe_update(ch_ui.update_data, current_fps, prog, eta, current_ratio)
+                                        self.safe_update(card.set_progress, prog, COLOR_ACCENT)
+                
+                                        last_ui_update_time = now
                     except Exception:
                         continue
                 
