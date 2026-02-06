@@ -364,57 +364,61 @@ def find_best_cache_drive(source_drive_letter=None, manual_override=None):
 class InfinityScope(ctk.CTkCanvas):
     def __init__(self, master, **kwargs):
         super().__init__(master, bg=COLOR_PANEL_RIGHT, highlightthickness=0, **kwargs)
-        self.points = [] # 存储数据点
+        self.points = []
         self.display_max = 10.0  
         self.target_max = 10.0   
-        self.bind("<Configure>", lambda e: self.draw()) # 窗口大小改变时重绘
+        self.needs_redraw = False # 增加标记位，只有数据更新了才画
         self.running = True
+        self.bind("<Configure>", lambda e: self.force_draw()) 
         self.animate_loop()
 
-    # 添加数据点
     def add_point(self, val):
         self.points.append(val)
-        if len(self.points) > 100: self.points.pop(0) # 最多保留100个点
+        if len(self.points) > 100: self.points.pop(0)
         current_data_max = max(self.points) if self.points else 10
-        self.target_max = max(current_data_max, 10) * 1.2 # 动态调整Y轴上限
+        self.target_max = max(current_data_max, 10) * 1.2
+        self.needs_redraw = True # 标记：有新数据了，需要画
 
-    # 动画循环：让波形图平滑滚动
+    def force_draw(self):
+        self.needs_redraw = True
+        self.draw()
+
     def animate_loop(self):
         if self.winfo_exists() and self.running:
+            # 平滑缩放动画
             diff = self.target_max - self.display_max
-            if abs(diff) > 0.1:
-                self.display_max += diff * 0.1 # 平滑过渡效果
-                self.draw() 
-            self.after(30, self.animate_loop) # 每30毫秒刷新一次
+            if abs(diff) > 0.01:
+                self.display_max += diff * 0.1
+                self.needs_redraw = True 
 
-    # 绘制函数
+            if self.needs_redraw:
+                self.draw()
+                self.needs_redraw = False # 画完重置
+
+            self.after(33, self.animate_loop) # 约 30 帧/秒
+
     def draw(self):
-        self.delete("all") # 清空画布
+        self.delete("all")
         w = self.winfo_width()
         h = self.winfo_height()
         if w < 10 or h < 10 or not self.points: return
+        
         scale_y = (h - 20) / self.display_max
-        # 画一条中线
         self.create_line(0, h/2, w, h/2, fill="#2a2a2a", dash=(4, 4))
+        
         n = len(self.points)
         if n < 2: return
-        step_x = w / (n - 1)
+        
+        step_x = w / 99 # 固定宽度步长，不随点数抖动
         coords = []
-        # 计算所有点的坐标
         for i, val in enumerate(self.points):
             x = i * step_x
             y = h - (val * scale_y) - 10
             coords.extend([x, y])
+            
         if len(coords) >= 4:
-            # 画线
+            # 使用绿色渐变视觉效果
             self.create_line(coords, fill=COLOR_CHART_LINE, width=2, smooth=True)
-    
-    # 清空图表
-    def clear(self):
-        self.points = []
-        self.target_max = 10.0
-        self.display_max = 10.0 
-        self.delete("all")
 
 # 自定义控件：监控通道 (MonitorChannel) - 右边那个跳动的小窗口
 class MonitorChannel(ctk.CTkFrame):
@@ -706,7 +710,7 @@ class UltraEncoderApp(DnDWindow):
     def safe_update(self, func, *args, **kwargs):
         if self.winfo_exists():
             # 使用 after 方法把任务扔回主线程执行
-            self.after(5, partial(self._guarded_call, func, *args, **kwargs))
+            self.after(10, partial(self._guarded_call, func, *args, **kwargs))
 
     def _guarded_call(self, func, *args, **kwargs):
         try:
@@ -1648,7 +1652,7 @@ class UltraEncoderApp(DnDWindow):
                             elif key == "out_time_us":
                                 try:
                                     now = time.time()
-                                    if now - last_ui_update_time > 0.25: # 每0.25秒更新一次界面
+                                    if now - last_ui_update_time > 0.2: # 每0.2秒更新一次界面
                                         us = int(value)
                                         current_sec = us / 1000000.0
                                         if duration > 0:
