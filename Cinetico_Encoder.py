@@ -1079,29 +1079,37 @@ class UltraEncoderApp(DnDWindow):
                                                   selected_color=COLOR_ACCENT, corner_radius=10)
         self.seg_priority.pack(fill="x", pady=(5, 0))
 
-        # --- 2. 并发数选择 ---
+        # --- 2. 并发数与功能开关 (分层布局，防止挤压) ---
         row3 = ctk.CTkFrame(l_btm, fg_color="transparent")
-        row3.pack(fill="x", pady=(10, 5), padx=15) # pady 改小
+        row3.pack(fill="x", pady=(10, 5), padx=15)
         ctk.CTkLabel(row3, text="并发任务数量", font=("微软雅黑", 12, "bold"), text_color="#DDD").pack(anchor="w")
-        w_box = ctk.CTkFrame(row3, fg_color="transparent")
-        w_box.pack(fill="x")
-        self.worker_var = ctk.StringVar(value="2")
-        self.seg_worker = ctk.CTkSegmentedButton(w_box, values=["1", "2", "3", "4"], variable=self.worker_var, 
-                                               corner_radius=10, command=self.update_monitor_layout)
-        self.seg_worker.pack(side="left", fill="x", expand=True)
-        self.gpu_var = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(w_box, text="GPU", width=60, variable=self.gpu_var, progress_color=COLOR_ACCENT).pack(side="right", padx=(10,0))
-        self.keep_meta_var = ctk.BooleanVar(value=True) # 默认开启
-        self.sw_meta = ctk.CTkSwitch(w_box, text="保留信息", width=80, variable=self.keep_meta_var, progress_color=COLOR_RAM, font=("微软雅黑", 11))
-        self.sw_meta.pack(side="right", padx=(5,0))
-        self.hybrid_var = ctk.BooleanVar(value=False)
-        self.sw_hybrid = ctk.CTkSwitch(w_box, text="异构分流", width=80, variable=self.hybrid_var, 
-                                       progress_color=COLOR_SUCCESS, font=("微软雅黑", 11))
-        self.sw_hybrid.pack(side="right", padx=(5,0))
         
+        # 上排：并发数选择
+        w_box_top = ctk.CTkFrame(row3, fg_color="transparent")
+        w_box_top.pack(fill="x", pady=(5, 2))
+        self.worker_var = ctk.StringVar(value="2")
+        self.seg_worker = ctk.CTkSegmentedButton(w_box_top, values=["1", "2", "3", "4"], variable=self.worker_var, 
+                                               corner_radius=10, command=self.update_monitor_layout)
+        self.seg_worker.pack(fill="x", expand=True)
+
+        # 下排：核心开关组 (去掉重复，横向排布)
+        w_box_btm = ctk.CTkFrame(row3, fg_color="transparent")
+        w_box_btm.pack(fill="x", pady=(5, 0))
+        
+        # GPU 开关 (仅保留一个)
         self.gpu_var = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(w_box, text="GPU", width=60, variable=self.gpu_var, 
-                     progress_color=COLOR_ACCENT).pack(side="right", padx=(5,0))
+        ctk.CTkSwitch(w_box_btm, text="GPU", width=60, variable=self.gpu_var, 
+                     progress_color=COLOR_ACCENT).pack(side="left")
+        
+        # 保留信息
+        self.keep_meta_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(w_box_btm, text="保留信息", width=80, variable=self.keep_meta_var, 
+                     progress_color=COLOR_RAM, font=("微软雅黑", 11)).pack(side="left", padx=5)
+        
+        # 异构分流
+        self.hybrid_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(w_box_btm, text="异构分流", width=80, variable=self.hybrid_var, 
+                     progress_color=COLOR_SUCCESS, font=("微软雅黑", 11)).pack(side="left", padx=5)
 
         # --- 3. 画质滑块 ---
         row2 = ctk.CTkFrame(l_btm, fg_color="transparent")
@@ -1682,60 +1690,53 @@ class UltraEncoderApp(DnDWindow):
                         ctypes.windll.kernel32.CloseHandle(h_sub)
                 except: pass
 
+                # --- 1. 状态记忆容器 (必须放在循环外部，防止被重置) ---
+                progress_stats = {"fps": "0", "out_time_us": "0", "speed": "0x", "frame": "0"}
                 start_t = time.time()
                 last_ui_update_time = 0 
                 
-                current_fps = 0
-                # 读取FFmpeg输出日志，解析进度
                 for line in proc.stdout:
                     if self.stop_flag: break
                     try: 
-                        # 直接解码并存储，不做多余处理
                         line_str = line.decode('utf-8', errors='ignore').strip()
                         if not line_str: continue
+                        output_log.append(line_str)
         
-                        output_log.append(line_str) # 自动维持 200 行上限
-        
-                        # 只在检测到特定关键标识时才进行复杂的字符串分割
+                        # --- 2. 关键缝合点：更新字典而不是重置它 ---
                         if "=" in line_str:
-                                    # 1. 解析 FFmpeg 的进度键值对
-                                    parts = dict(item.split("=") for item in line_str.split() if "=" in item)
+                            for item in line_str.split():
+                                if "=" in item:
+                                    k, v = item.split("=", 1)
+                                    progress_stats[k] = v # 这里只更新出现的字段，没出现的字段保持上次的值
             
-                                    # 2. 实时抓取 FPS（虽然你 CPU 很强，但看着数值跳动才爽）
-                                    current_fps = int(float(parts.get("fps", 0)))
-            
-                                    now = time.time()
-                                    if now - last_ui_update_time > 0.3: # 每 0.3 秒更新一次界面
-                                        # 【修正点】：从 parts 字典中获取微秒值
-                                        us_str = parts.get("out_time_us", "0")
-                                        us = int(us_str)
-                                        current_sec = us / 1000000.0
+                            now = time.time()
+                            if now - last_ui_update_time > 0.3:
+                                # --- 3. 从记忆库中提取最新数据 ---
+                                current_fps = int(float(progress_stats.get("fps", 0)))
+                                us = int(progress_stats.get("out_time_us", 0))
+                                current_sec = us / 1000000.0
                 
-                                        # 初始化默认值，防止 duration 为 0 时后面报错
-                                        prog = 0
-                                        eta = "--:--"
+                                prog = 0
+                                eta = "--:--"
+                                if duration > 0:
+                                    prog = min(1.0, current_sec / duration)
+                                    elap = now - start_t
+                                    if prog > 0.001:
+                                        eta_sec = (elap / prog - elap)
+                                        eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
                 
-                                        if duration > 0:
-                                            prog = current_sec / duration
-                                            elap = now - start_t
-                                            # 计算剩余时间 (ETA)
-                                            if prog > 0.001:
-                                                eta_sec = (elap / prog - elap)
-                                                eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
+                                # 计算实时压缩率
+                                try:
+                                    out_size = os.path.getsize(working_output_file)
+                                    current_ratio = (out_size / (input_size * prog)) * 100 if prog > 0.01 else 0
+                                except: 
+                                    current_ratio = 0
                 
-                                        # 实时计算当前压缩率
-                                        try:
-                                            out_size = os.path.getsize(working_output_file)
-                                            # 公式：当前输出大小 / (原文件大小 * 进度)
-                                            current_ratio = (out_size / (input_size * prog)) * 100 if prog > 0.01 else 0
-                                        except: 
-                                            current_ratio = 0
+                                # 推送 UI 更新
+                                self.safe_update(ch_ui.update_data, current_fps, prog, eta, current_ratio)
+                                self.safe_update(card.set_progress, prog, COLOR_ACCENT)
                 
-                                        # 统一更新 UI，不需要重复调用两次 safe_update
-                                        self.safe_update(ch_ui.update_data, current_fps, prog, eta, current_ratio)
-                                        self.safe_update(card.set_progress, prog, COLOR_ACCENT)
-                
-                                        last_ui_update_time = now
+                                last_ui_update_time = now
                     except Exception:
                         continue
                 
