@@ -1618,23 +1618,14 @@ class UltraEncoderApp(DnDWindow):
                 is_mixed_mode = self.hybrid_var.get()
                 is_even_slot = (my_slot_idx % 2 == 1) # 0、2通道全GPU，1、3通道CPU解码
                                 
-                if using_gpu:
-                    # 如果开启了混合模式且是偶数槽位(通道2/4)，则由CPU解码以解除NVDEC瓶颈
-                    if is_mixed_mode and is_even_slot:
-                        # 此时不添加 -hwaccel cuda，FFmpeg会自动调用14900K进行软解
-                        pass 
-                    else:
-                        # 全链路 GPU 加速 (解码+编码都在显卡)
-                        cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
-
                 # === 构建FFmpeg命令 ===
-                cmd = ["ffmpeg", "-y"]
+                cmd = ["ffmpeg", "-y"] # 1. 先创建列表
                 if using_gpu: 
-                    # 混合模式判断：通道1、3全GPU，通道2、4(偶数槽位)CPU解码
+                    # 2. 再根据逻辑添加参数
                     if is_mixed_mode and is_even_slot:
                         pass # 14900K 暴力软解
                     else:
-                        cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+                        cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]) # 现在 cmd 已定义，不会报错了
                 cmd.extend(["-i", input_arg_final])
                 cmd.extend(["-c:v", v_codec])
                 
