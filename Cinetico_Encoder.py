@@ -73,6 +73,7 @@ import http.server # 用来搭建一个微型服务器，用于内存流播放
 import socketserver
 from http import HTTPStatus
 from functools import partial # 函数工具，用来固定参数
+from collections import deque
 
 # =========================================================================
 # === 全局视觉配置 (决定软件长什么样) ===
@@ -1547,7 +1548,7 @@ class UltraEncoderApp(DnDWindow):
 
             # 初始化变量
             success = False
-            output_log = []
+            output_log = deque(maxlen=200)
             ram_server = None 
             
             
@@ -1683,44 +1684,43 @@ class UltraEncoderApp(DnDWindow):
                 for line in proc.stdout:
                     if self.stop_flag: break
                     try: 
+                        # 直接解码并存储，不做多余处理
                         line_str = line.decode('utf-8', errors='ignore').strip()
-                        if line_str: output_log.append(line_str)
-                        
+                        if not line_str: continue
+        
+                        output_log.append(line_str) # 自动维持 200 行上限
+        
+                        # 只在检测到特定关键标识时才进行复杂的字符串分割
                         if "=" in line_str:
-                            key, value = line_str.split("=", 1)
-                            key = key.strip(); value = value.strip()
-                            
-                            if key == "fps":
-                                try: current_fps = int(float(value))
-                                except: pass
-                            elif key == "out_time_us":
-                                try:
-                                    now = time.time()
-                                    if now - last_ui_update_time > 0.2: # 每0.2秒更新一次界面
-                                        us = int(value)
-                                        current_sec = us / 1000000.0
-                                        if duration > 0:
-                                            prog = current_sec / duration
-                                            elap = now - start_t
-                                            # 计算剩余时间 (ETA)
-                                            eta_sec = (elap / prog - elap) if prog > 0.01 else 0
-                                            eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
-                                            # 更新UI
-                                            self.safe_update(card.set_progress, prog, COLOR_ACCENT)
-                                            self.safe_update(ch_ui.update_data, current_fps, prog, eta)
-                                        last_ui_update_time = now
+                            parts = dict(item.split("=") for item in line_str.split() if "=" in item)
+            
+                            # 频率控制：由之前的 0.2s 稍微放宽到 0.3s，降低 UI 刷新对主线程的锁定
+                            now = time.time()
+                            if now - last_ui_update_time > 0.3: # 每0.3秒更新一次界面
+                                us = int(value)
+                                current_sec = us / 1000000.0
+                                if duration > 0:
+                                    prog = current_sec / duration
+                                    elap = now - start_t
+                                    # 计算剩余时间 (ETA)
+                                    eta_sec = (elap / prog - elap) if prog > 0.01 else 0
+                                    eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
+                                    # 更新UI
+                                    self.safe_update(card.set_progress, prog, COLOR_ACCENT)
+                                    self.safe_update(ch_ui.update_data, current_fps, prog, eta)
+                                last_ui_update_time = now
 
-                                        # [新增] 实时计算当前压缩率
-                                        try:
-                                            out_size = os.path.getsize(working_output_file)
-                                            # 公式：(当前输出大小 / (原文件大小 * 进度百分比)) * 100
-                                            current_ratio = (out_size / (input_size * prog)) * 100 if prog > 0.01 else 0
-                                        except: current_ratio = 0
+                                # [新增] 实时计算当前压缩率
+                                try:
+                                    out_size = os.path.getsize(working_output_file)
+                                    # 公式：(当前输出大小 / (原文件大小 * 进度百分比)) * 100
+                                    current_ratio = (out_size / (input_size * prog)) * 100 if prog > 0.01 else 0
+                                except: current_ratio = 0
                                 
-                                        self.safe_update(ch_ui.update_data, current_fps, prog, eta, current_ratio)
-                                        last_ui_update_time = now
-                                except: pass
-                    except: continue
+                                self.safe_update(ch_ui.update_data, current_fps, prog, eta, current_ratio)
+                                last_ui_update_time = now
+                    except Exception:
+                        continue
                 
                 proc.wait() # 等待进程结束
                 if proc in self.active_procs: self.active_procs.remove(proc)
