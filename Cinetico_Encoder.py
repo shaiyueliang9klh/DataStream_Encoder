@@ -851,6 +851,10 @@ class UltraEncoderApp(DnDWindow):
             
             if not new_added: return
             
+            # --- [核心修复] 按文件体积从低到高排序 ---
+            # lambda x: os.path.getsize(x) 会获取每个路径对应的文件大小作为排序依据
+            self.file_queue.sort(key=lambda x: os.path.getsize(x))
+
             # 刷新界面上的列表显示
             for i, f in enumerate(self.file_queue):
                 if f in self.task_widgets:
