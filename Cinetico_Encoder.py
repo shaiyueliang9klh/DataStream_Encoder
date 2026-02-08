@@ -102,6 +102,14 @@ STATUS_READY = 2     # 准备就绪
 STATUS_RUN = 3       # 正在运行
 STATUS_DONE = 5      # 已完成
 STATUS_ERR = -1      # 出错
+# --- [新增] 细分状态码 (给总指挥看的) ---
+STATE_PENDING = 0        # 刚进队列，啥也没干
+STATE_QUEUED_IO = 1      # 指挥官已批准 IO，正在等 IO 线程池空位
+STATE_CACHING = 2        # 正在读硬盘/写内存
+STATE_READY = 3          # 数据已就绪 (在内存或SSD缓存中)，等待计算资源
+STATE_ENCODING = 4       # 正在编码 (FFmpeg 跑着呢)
+STATE_DONE = 5           # 完事
+STATE_ERROR = -1         # 挂了
 
 # 定义Windows进程优先级（用来控制是否抢占CPU）
 PRIORITY_NORMAL = 0x00000020 # 正常
@@ -557,6 +565,15 @@ class TaskCard(ctk.CTkFrame):
         self.source_mode = "PENDING"
         self.filepath = filepath
         
+        # [新增] 预先获取文件大小，供总指挥计算预算
+        try:
+            self.file_size_gb = os.path.getsize(filepath) / (1024**3)
+        except:
+            self.file_size_gb = 0.0
+        
+        self.ram_cost = 0.0 # 实际占用的 RAM (只有加载进内存才算)
+        self.status_code = STATE_PENDING # 初始化状态
+
         # 序号
         self.lbl_index = ctk.CTkLabel(self, text=f"{index:02d}", font=("Impact", 20), text_color="#555")
         self.lbl_index.grid(row=0, column=0, rowspan=2, padx=(10, 5))
@@ -1257,7 +1274,7 @@ class UltraEncoderApp(DnDWindow):
             self.monitor_slots.append(ch)
 
     # --- 缓存处理核心逻辑 ---
-# [修复版] 智能缓存函数：修复 no_wait 逻辑跳跃问题
+    # [修复版] 智能缓存函数：修复 no_wait 逻辑跳跃问题
     def process_caching(self, src_path, widget, lock_obj=None, no_wait=False):
         file_size = os.path.getsize(src_path)
         file_size_gb = file_size / (1024**3)
@@ -1454,54 +1471,113 @@ class UltraEncoderApp(DnDWindow):
         if files: self.add_list(files)
 
     # --- 调度引擎 (Engine) ---
-    # 这个函数是总指挥，负责不断地从队列里拿任务给 process 函数去跑
-    # [核心修复] 增加防抢跑逻辑
+    # --- [重构] 总指挥 (Grand Commander) ---
     def engine(self):
+        # 1. 初始化资源账本
+        total_ram_limit = MAX_RAM_LOAD_GB  # 最大可用 RAM (比如 50GB)
+        current_ram_usage = 0.0            # 当前已用 RAM
+        
+        # 线程池分开：IO池 和 计算池
+        # IO 池：如果是 SSD 环境，允许并发；否则只能 1 个
+        is_cache_ssd = is_drive_ssd(self.temp_dir) or (self.manual_cache_path and is_drive_ssd(self.manual_cache_path))
+        
+        # [修改点] 纯固态环境：IO 并发数 = 用户设置的并发数；机械硬盘 = 1
+        io_concurrency = self.current_workers if is_cache_ssd else 1
+        
+        self.io_executor = ThreadPoolExecutor(max_workers=io_concurrency)
+        
+        # 循环 Tick
         while not self.stop_flag:
-            tasks_to_run = []
-            active_count = len(self.submitted_tasks) 
-            slots_free = self.current_workers - active_count
+            # --- A. 资源盘点 (每轮循环都重新计算，确保准确) ---
+            active_io_count = 0
+            active_compute_count = 0
+            current_ram_usage = 0.0
             
-            # 1. 填充空闲槽位
-            if slots_free > 0:
+            with self.queue_lock:
+                for f in self.file_queue:
+                    card = self.task_widgets[f]
+                    # 统计 RAM：只有 RAM 模式且未完成的任务才占空间
+                    if card.source_mode == "RAM" and card.status_code not in [STATE_DONE, STATE_ERROR]:
+                        current_ram_usage += card.file_size_gb
+                    
+                    # 统计活跃线程
+                    if card.status_code in [STATE_QUEUED_IO, STATE_CACHING]:
+                        active_io_count += 1
+                    elif card.status_code == STATE_ENCODING:
+                        active_compute_count += 1
+
+            # --- B. 调度 IO (后勤) ---
+            # 只有当 IO 槽位有空，且还有任务在排队时
+            if active_io_count < io_concurrency:
                 with self.queue_lock:
                     for f in self.file_queue:
-                        if slots_free <= 0: break
-                        if f in self.submitted_tasks: continue 
                         card = self.task_widgets[f]
-                        if card.status_code in [STATUS_WAIT, STATUS_CACHING, STATUS_READY]:
-                            tasks_to_run.append(f)
-                            self.submitted_tasks.add(f)
-                            slots_free -= 1
-            
-            # 检查是否全部完成
-            if not tasks_to_run and active_count == 0 and self.file_queue:
-                all_done = True
+                        
+                        # 找到一个待命的任务
+                        if card.status_code == STATE_PENDING:
+                            # [智能 RAM 判断]
+                            # 预测：如果我们加载它，内存会爆吗？
+                            predicted_usage = current_ram_usage + card.file_size_gb
+                            
+                            # 决策：是否进 RAM
+                            should_use_ram = False
+                            if predicted_usage < total_ram_limit:
+                                should_use_ram = True
+                                # 预占位：虽然还没加载完，但我们在账本上先把它记下来，防止下一个任务超发
+                                current_ram_usage += card.file_size_gb 
+                            else:
+                                should_use_ram = False # 内存不够，走 SSD 缓存
+                            
+                            # 下达指令
+                            if should_use_ram:
+                                card.source_mode = "RAM"
+                            else:
+                                card.source_mode = "SSD_CACHE" # 强制 SSD 模式
+                            
+                            # 更改状态，防止重复提交
+                            card.status_code = STATE_QUEUED_IO
+                            active_io_count += 1
+                            
+                            # 派出后勤兵
+                            self.io_executor.submit(self._worker_io_task, f)
+                            
+                            # 如果 IO 槽位满了，停止本轮 IO 调度
+                            if active_io_count >= io_concurrency:
+                                break
+
+            # --- C. 调度计算 (前线) ---
+            # 只有当计算槽位有空
+            if active_compute_count < self.current_workers:
                 with self.queue_lock:
                     for f in self.file_queue:
-                        if self.task_widgets[f].status_code not in [STATUS_DONE, STATUS_ERR]:
-                            all_done = False; break
-                if all_done: break
+                        card = self.task_widgets[f]
+                        
+                        # 找到一个粮草已备好 (Ready) 的任务
+                        if card.status_code == STATE_READY:
+                            # 更改状态
+                            card.status_code = STATE_ENCODING
+                            active_compute_count += 1
+                            
+                            # 派出突击手
+                            self.executor.submit(self._worker_compute_task, f)
+                            
+                            if active_compute_count >= self.current_workers:
+                                break
             
-            # 2. 提交任务到线程池
-            if tasks_to_run:
-                for f in tasks_to_run:
-                    self.executor.submit(self.process, f)
+            # --- D. 检查全部完成 ---
+            all_done = True
+            with self.queue_lock:
+                for f in self.file_queue:
+                    if self.task_widgets[f].status_code not in [STATE_DONE, STATE_ERROR]:
+                        all_done = False; break
+            if all_done and active_io_count == 0 and active_compute_count == 0:
+                break
                 
-                # 【关键修复点】
-                # 如果这轮刚启动了新任务，强制休息0.5秒，并跳过预加载检查！
-                # 这能确保任务1、2完全启动并占住位置后，才轮得到任务3
-                time.sleep(0.5) 
-                continue 
+            time.sleep(0.1) # 休息一下，防止 CPU 空转
 
-            # 3. 只有在没有新任务启动时，才检查预加载
-            self.check_and_preload()
-
-            time.sleep(0.1) 
-
-        if not self.stop_flag:
-            self.safe_update(messagebox.showinfo, "完成", "所有任务已处理完毕！")
+        # 循环结束，善后
         self.running = False
+        self.safe_update(messagebox.showinfo, "完成", "所有任务处理完毕")
         self.safe_update(self.reset_ui_state)
 
     # [修复版] 智能预加载检查：流控 + 激进策略
@@ -1605,366 +1681,246 @@ class UltraEncoderApp(DnDWindow):
         except:
             return False
 
-    # --- 任务执行函数 (Process) ---
-    # 这是一个工人，负责具体压制一个视频
-    def process(self, input_file):
-        my_slot_idx = None
-        # [新增] 获取输入文件大小，供后续计算压缩率使用
-        input_size = os.path.getsize(input_file)
-
+    # --- [新增] 后勤兵：只负责 IO (读硬盘/写内存) ---
+    def _worker_io_task(self, task_file):
+        card = self.task_widgets[task_file]
         try:
-            if self.stop_flag: return
+            # 标记状态
+            self.safe_update(card.set_status, "📥正在加载...", COLOR_READING, STATE_CACHING)
             
-            # 1. 申请一个监控通道（UI上的小方块）
-            wait_start = time.time()
-            while my_slot_idx is None and not self.stop_flag:
-                with self.slot_lock:
-                    if self.available_indices: my_slot_idx = self.available_indices.pop(0)
-                if my_slot_idx is None: 
-                    # 如果30秒还没申请到（死锁保护），强制重置
-                    if time.time() - wait_start > 30: 
-                         with self.slot_lock:
-                             self.available_indices = list(range(self.current_workers))
-                         continue
-                    time.sleep(0.1)
-            if self.stop_flag: return
-
-            card = self.task_widgets[input_file]
-            ch_ui = self.monitor_slots[my_slot_idx]
+            # 复用你原有的 process_caching 逻辑，但去掉了锁等待，因为指挥官已经批了条子
+            # 注意：这里我们强制它尝试加载，具体的 RAM/SSD 决策指挥官已经做好了
+            # 如果指挥官决定用 RAM，它会分配额度；否则走 SSD 缓存
             
-            # 界面滚动到当前任务
-            # 修改后的代码：
-            # 给它 100 毫秒的时间让界面先喘口气，然后再滚动
-            if self.winfo_exists():
-                self.after(100, lambda: self.scroll_to_card(card))
-
-            self.safe_update(self.update_run_status)
-            
-            # 等待缓存完成
-            while card.status_code == STATUS_CACHING and not self.stop_flag: 
-                time.sleep(0.5)
-
-            # 如果还没缓存（比如跳过了engine的预加载），这里补充缓存
-            # 在 process 函数里：
-            if card.source_mode == "PENDING":
-                self.read_lock.acquire() 
-                try:
-                    if card.source_mode == "PENDING" and not self.stop_flag:
-                       # 这里不需要传 lock_obj，因为上面已经 acquire 了
-                       self.process_caching(input_file, card) 
-                finally:
-                    self.read_lock.release()
-            
-            if self.stop_flag: return 
-
-            fname = os.path.basename(input_file)
-
-            # [核心修复] 真正开始压制前，更新监控通道的标题，别让它一直显示“空闲”
-            # 我们把 source_mode 映射成更好看的中文标签
-            mode_map = {"RAM": "内存加速", "SSD_CACHE": "高速缓存", "DIRECT": "磁盘直读", "PENDING": "准备中"}
-            display_tag = mode_map.get(card.source_mode, card.source_mode)
-            self.safe_update(ch_ui.activate, fname, display_tag)
-
-            # 初始化变量
-            success = False
-            output_log = deque(maxlen=200)
-            ram_server = None 
-            
-            
-            name, ext = os.path.splitext(fname)
-            codec_sel = self.codec_var.get()
-            
-            # 生成后缀名
-            suffix = "_H264"
-            if "H.265" in codec_sel: suffix = "_H265"
-            elif "AV1" in codec_sel: suffix = "_AV1"
-            
-            final_target_file = os.path.join(os.path.dirname(input_file), f"{name}{suffix}{ext}")
-            
-            # 准备临时输出目录
-            best_cache_root = find_best_cache_drive(source_drive_letter=os.path.splitdrive(input_file)[0], manual_override=self.manual_cache_path)
-            best_cache_dir = os.path.join(best_cache_root, "_Ultra_Smart_Cache_")
-            os.makedirs(best_cache_dir, exist_ok=True)
-            self.temp_dir = best_cache_dir 
-            
-            temp_name = f"TEMP_{int(time.time())}_{name}{suffix}{ext}"
-            working_output_file = os.path.join(best_cache_dir, temp_name)
-            need_move_back = True
-
-            # 显存等待逻辑
-            using_gpu = self.gpu_var.get()
-            if using_gpu:
-                wait_gpu_start = time.time()
-                while not self.stop_flag:
-                    if self.should_use_gpu(codec_sel):
-                        with self.gpu_lock:
-                            self.gpu_active_count += 1
-                        break
-                    else:
-                        self.safe_update(card.set_status, "⏳ 等待GPU显存...", COLOR_WAITING, STATUS_RUN)
-                        time.sleep(1)
-                        if time.time() - wait_gpu_start > 120: # 120秒超时放弃GPU
-                            using_gpu = False
-                            break
-
-            try: 
-                self.safe_update(card.set_status, "▶️ 编码中...", COLOR_ACCENT, STATUS_RUN)
-
-                # [修正] 确定输入源
-                input_arg_final = input_file
-                if card.source_mode == "RAM":
-                    # 1. 路径编码 (安全处理中文、空格、特殊符号)
-                    # 例如 "C:\我的 视频.mp4" -> "C%3A%5C%E6%88%91%E7%9A%84%20%E8%A7%86%E9%A2%91.mp4"
-                    safe_path = urllib.parse.quote(input_file)
-                    
-                    # 2. 指向全局端口
-                    input_arg_final = f"http://127.0.0.1:{self.global_port}/{safe_path}"
-                    
-                elif card.source_mode == "SSD_CACHE": 
-                    input_arg_final = card.ssd_cache_path
-
-                # [检测] 显卡是否支持硬解该文件
-                # 默认为 False，只有当开关开启且通过探针测试才为 True
-                hw_decode_supported = False
-            
-                if using_gpu:
-                    self.safe_update(card.set_status, "🔍 检测硬解兼容性...", COLOR_WAITING, STATUS_RUN)
-                    # 对每个文件单独检测！
-                    if self.check_gpu_decode_capability(input_arg_final if "http" not in input_arg_final else input_file):
-                        hw_decode_supported = True
-                    else:
-                        print(f"[{fname}] GPU不支持硬解 (可能是4:2:2格式)，切换为 CPU解码 -> GPU编码 模式")
-
-                self.safe_update(card.set_status, "▶️ 编码中...", COLOR_ACCENT, STATUS_RUN)
-
-                # 选择FFmpeg编码器 (输出端)
-                if using_gpu:
-                    if "H.265" in codec_sel: v_codec = "hevc_nvenc"
-                    elif "AV1" in codec_sel: v_codec = "av1_nvenc"
-                    else: v_codec = "h264_nvenc"
-                else:
-                    if "H.265" in codec_sel: v_codec = "libx265"
-                    elif "AV1" in codec_sel: v_codec = "libaom-av1"
-                    else: v_codec = "libx264"
-
-                # [核心功能] 异构分流调度
-                is_mixed_mode = self.hybrid_var.get()
-                is_even_slot = (my_slot_idx % 2 == 1) 
-            
-                # === 构建FFmpeg命令 ===
-                cmd = ["ffmpeg", "-y"] 
-            
-                # [关键逻辑修正]
-                # 只有在 (想用GPU) AND (没开启异构分流的CPU通道) AND (显卡确实能硬解) 时，才开启 hwaccel
-                if using_gpu and not (is_mixed_mode and is_even_slot) and hw_decode_supported:
-                    cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
-            
-                # 否则，FFmpeg 默认就会用 CPU 解码，无需额外参数，直接读入即可
-            
-                cmd.extend(["-i", input_arg_final])
-            
-                if self.keep_meta_var.get():
-                    cmd.extend(["-map_metadata", "0"])
-            
-                cmd.extend(["-c:v", v_codec])
-            
-                # 设置编码参数 (CRF/QP)
-                if using_gpu:
-                    # 只有当它是全链路 GPU (解码+编码) 时，才需要用 scale_cuda
-                    if hw_decode_supported and not (is_mixed_mode and is_even_slot):
-                        cmd.extend(["-vf", "scale_cuda=format=yuv420p"])
-                    else:
-                        # 如果是 CPU 解码 (不论是因为不支持硬解，还是因为异构分流)，
-                        # 此时数据在内存里是普通的 YUV，需要用软件滤镜转格式，再传给 NVENC
-                        cmd.extend(["-pix_fmt", "yuv420p"])
-
-                    if "AV1" in codec_sel:
-                            cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), "-preset", "p5", "-b:v", "0"]) 
-                    else:
-                        cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), "-preset", "p6", "-b:v", "0"])
-                else:
-                    # 纯 CPU 模式
-                    cmd.extend(["-pix_fmt", "yuv420p"])
-                    cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
-                    # [CPU优化] 限制线程数，防止系统卡死
-                    # 设为 0 让 FFmpeg 自动判断，但配合 PriorityClass 限制优先级
-                    # 如果用户反馈卡顿，可以改为 "-threads", "8"
-                    cmd.extend(["-threads", "0"])
-            
-                # 音频和其他参数保持不变...
-                cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", working_output_file])
-
-                # 获取总时长用于计算进度
-                dur_file = input_file 
-                duration = self.get_dur(dur_file)
-                
-                # 隐藏命令行窗口
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                
-                # 启动子进程
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si)
-                self.active_procs.append(proc)
-                
-                # 设置进程优先级
-                try:
-                    p_val = {"常规": PRIORITY_NORMAL, "优先": PRIORITY_ABOVE, "极速": PRIORITY_HIGH}.get(self.priority_var.get(), PRIORITY_ABOVE)
-                    h_sub = ctypes.windll.kernel32.OpenProcess(0x0100 | 0x0200, False, proc.pid)
-                    if h_sub:
-                        ctypes.windll.kernel32.SetPriorityClass(h_sub, p_val)
-                        disable_power_throttling(h_sub)
-                        ctypes.windll.kernel32.CloseHandle(h_sub)
-                except: pass
-
-                # --- 1. 状态记忆容器 (必须放在循环外部，防止被重置) ---
-                progress_stats = {"fps": "0", "out_time_us": "0", "speed": "0x", "frame": "0"}
-                start_t = time.time()
-                last_ui_update_time = 0 
-                
-                for line in proc.stdout:
-                    if self.stop_flag: break
-                    try: 
-                        line_str = line.decode('utf-8', errors='ignore').strip()
-                        if not line_str: continue
-                        output_log.append(line_str)
-        
-                        # --- 2. 关键缝合点：更新字典而不是重置它 ---
-                        if "=" in line_str:
-                            for item in line_str.split():
-                                if "=" in item:
-                                    k, v = item.split("=", 1)
-                                    progress_stats[k] = v # 这里只更新出现的字段，没出现的字段保持上次的值
-            
-                            now = time.time()
-                            if now - last_ui_update_time > 0.3:
-                                # --- 3. 从记忆库中提取最新数据 ---
-                                current_fps = int(float(progress_stats.get("fps", 0)))
-                                us = int(progress_stats.get("out_time_us", 0))
-                                current_sec = us / 1000000.0
-                
-                                prog = 0
-                                eta = "--:--"
-                                if duration > 0:
-                                    prog = min(1.0, current_sec / duration)
-                                    elap = now - start_t
-                                    if prog > 0.001:
-                                        eta_sec = (elap / prog - elap)
-                                        eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
-                
-                                # 计算实时压缩率
-                                try:
-                                    out_size = os.path.getsize(working_output_file)
-                                    current_ratio = (out_size / (input_size * prog)) * 100 if prog > 0.01 else 0
-                                except: 
-                                    current_ratio = 0
-                
-                                # 推送 UI 更新
-                                self.safe_update(ch_ui.update_data, current_fps, prog, eta, current_ratio)
-                                self.safe_update(card.set_progress, prog, COLOR_ACCENT)
-                
-                                last_ui_update_time = now
-                    except Exception:
-                        continue
-                
-                proc.wait() # 等待进程结束
-                if proc in self.active_procs: self.active_procs.remove(proc)
-
-            finally:
-                # 必须确保显卡计数器归还，否则会死锁
-                if using_gpu:
-                    with self.gpu_lock:
-                        self.gpu_active_count -= 1
-                        if self.gpu_active_count < 0: self.gpu_active_count = 0
-                # [安全修正] 使用 .pop() 防止 KeyError 崩溃
-                # 无论之前是否使用了内存，尝试清理总是安全的
-                GLOBAL_RAM_STORAGE.pop(input_file, None)
-            
-                # 清理状态
-                card.clean_memory()
-                if card.ssd_cache_path:
-                    try: 
-                        os.remove(card.ssd_cache_path)
-                        self.temp_files.remove(card.ssd_cache_path)
-                    except: pass
-
-
-            # 处理停止信号
-            if self.stop_flag: 
-                if ram_server: ram_server.shutdown(); ram_server.server_close()
-                card.clean_memory()
-                if need_move_back and os.path.exists(working_output_file):
-                    try: os.remove(working_output_file)
-                    except: pass
-                return 
-
-            # 检查结果
-            if proc.returncode == 0:
-                if os.path.exists(working_output_file) and os.path.getsize(working_output_file) > 100*1024:
-                    success = True
-                else:
-                    output_log.append(f"[System Error] File too small: {working_output_file}")
-            
-            if ram_server: ram_server.shutdown(); ram_server.server_close()
-
-            # 成功后，把临时文件移回原目录
-            if success and need_move_back:
-                try:
-                    self.safe_update(card.set_status, "📦 回写硬盘中...", COLOR_MOVING, STATUS_RUN)
-                    shutil.move(working_output_file, final_target_file)
-
-                    if self.keep_meta_var.get():
-                        try:
-                            # copystat 会拷贝权限、最后访问时间、最后修改时间
-                            shutil.copystat(input_file, final_target_file)
-                        except Exception as e:
-                            print(f"时间戳同步失败: {e}")
-
-                except Exception as e:
-                    success = False
-                    output_log.append(f"[Move Error] Failed to move file back: {e}")
-
-            # 清理缓存
-            card.clean_memory()
-            if card.ssd_cache_path:
-                try: 
-                    os.remove(card.ssd_cache_path)
-                    self.temp_files.remove(card.ssd_cache_path)
-                except: pass
-            
-            # 重置右侧监控通道
-            self.safe_update(ch_ui.reset)
+            # 尝试加载 (这里调用你原有的 process_caching，但要确保它不会无限阻塞)
+            # 传入 no_wait=True，因为指挥官已经确认过资源了
+            success = self.process_caching(task_file, card, lock_obj=None, no_wait=True)
             
             if success:
-                 self.finished_tasks_count += 1 
-                 orig_sz = os.path.getsize(input_file)
-                 if os.path.exists(final_target_file):
-                     new_sz = os.path.getsize(final_target_file)
-                     sv = 100 - (new_sz/orig_sz*100) if orig_sz > 0 else 0
-                     self.safe_update(card.set_status, f"完成 | 压缩率: {sv:.1f}%", COLOR_SUCCESS, STATUS_DONE)
-                     self.safe_update(card.set_progress, 1, COLOR_SUCCESS)
-                 else:
-                     self.safe_update(card.set_status, "文件丢失", COLOR_ERROR, STATUS_ERR)
+                # 任务完成，标记为就绪，等待计算
+                self.safe_update(card.set_status, "⚡就绪 (等待编码)", COLOR_READY_RAM if card.source_mode == "RAM" else COLOR_SSD_CACHE, STATE_READY)
             else:
-                 # 失败处理
-                 if not self.stop_flag:
-                     self.safe_update(card.set_status, "失败 (点击看日志)", COLOR_ERROR, STATUS_ERR)
-                     # [修复] deque 不支持切片，必须先转成 list
-                     err_msg = "\n".join(list(output_log)[-30:])
-                     def show_err():
-                         messagebox.showerror(f"任务失败: {fname}", f"FFmpeg 报错日志 (最后30行):\n\n{err_msg}")
-                     self.safe_update(show_err)
+                self.safe_update(card.set_status, "IO 失败", COLOR_ERROR, STATE_ERROR)
 
-            self.safe_update(self.update_run_status) 
-            # 从提交列表里移除，标记为空闲
-            with self.queue_lock:
-                if input_file in self.submitted_tasks: self.submitted_tasks.remove(input_file)
+        except Exception as e:
+            print(f"IO Error: {e}")
+            self.safe_update(card.set_status, "IO 错误", COLOR_ERROR, STATE_ERROR)
+
+    # --- [新增] 突击手：只负责计算 (FFmpeg) ---
+# --- [修正] 突击手：只负责计算 (FFmpeg) ---
+    def _worker_compute_task(self, task_file):
+        card = self.task_widgets[task_file]
+        
+        # 1. [新增] 申请监控通道 (UI Slot)
+        # 必须给这个任务分配右侧的一个波形图窗口
+        slot_idx = -1
+        ch_ui = None
+        with self.slot_lock:
+            if self.available_indices:
+                slot_idx = self.available_indices.pop(0) # 拿走一个空闲号牌
+                if slot_idx < len(self.monitor_slots):
+                    ch_ui = self.monitor_slots[slot_idx]
+        
+        # 如果没拿到通道（理论上不应该发生，因为engine控制了并发数），就创建一个假的占位符防止报错
+        if not ch_ui: 
+            class DummyUI: 
+                def activate(self, *a): pass
+                def update_data(self, *a): pass
+                def reset(self): pass
+            ch_ui = DummyUI()
+
+        try:
+            self.safe_update(card.set_status, "▶️ 编码中...", COLOR_ACCENT, STATE_ENCODING)
+            
+            # --- 2. [补全] 初始化缺失的变量 ---
+            input_file = task_file
+            input_size = os.path.getsize(input_file)
+            fname = os.path.basename(input_file)
+            f_name_no_ext = os.path.splitext(fname)[0]
+            
+            # 确定输出文件名 (在原文件名后加 _Cinético)
+            output_dir = os.path.dirname(input_file)
+            working_output_file = os.path.join(output_dir, f"{f_name_no_ext}_Cinético.mp4")
+            
+            # 获取用户设置
+            codec_sel = self.codec_var.get()
+            using_gpu = self.should_use_gpu(codec_sel)
+            
+            # 确定 FFmpeg 编码器名称
+            v_codec = "libx264"
+            if "H.265" in codec_sel: v_codec = "libx265"
+            elif "AV1" in codec_sel: v_codec = "libsvtav1"
+            
+            if using_gpu:
+                if "H.264" in codec_sel: v_codec = "h264_nvenc"
+                elif "H.265" in codec_sel: v_codec = "hevc_nvenc"
+                elif "AV1" in codec_sel: v_codec = "av1_nvenc"
+
+            # --- 3. [补全] 确定输入源 (RAM / Cache / Direct) ---
+            # 这是“零拷贝环回”的核心：决定 FFmpeg 读哪里
+            input_arg_final = input_file # 默认直读
+            
+            if card.source_mode == "RAM":
+                # 构造 HTTP URL
+                safe_path = urllib.parse.quote(input_file)
+                input_arg_final = f"http://127.0.0.1:{self.global_port}/{safe_path}"
+            elif card.source_mode == "SSD_CACHE" and card.ssd_cache_path:
+                input_arg_final = card.ssd_cache_path
+            
+            # --- 4. [补全] 异构计算逻辑 ---
+            # 判断是否开启异构分流 (偶数通道用CPU，奇数用GPU，或者全GPU)
+            is_mixed_mode = self.hybrid_var.get()
+            # 这里用 slot_idx 来判断奇偶，实现任务分流
+            is_even_slot = (slot_idx % 2 == 0) 
+            
+            # 检测显卡是否支持硬解 (防止 4:2:2 10bit 导致硬解报错)
+            hw_decode_supported = self.check_gpu_decode_capability(input_file) if using_gpu else False
+
+            # 激活 UI 监控
+            tag_info = "GPU Accel" if using_gpu else "CPU Software"
+            if is_mixed_mode and is_even_slot: tag_info = "Hybrid CPU"
+            self.safe_update(ch_ui.activate, fname, tag_info)
+
+            # === 构建FFmpeg命令 ===
+            cmd = ["ffmpeg", "-y"] 
+            
+            # [关键逻辑] 硬件解码配置
+            # 只有在 (想用GPU) AND (没被分流到CPU) AND (显卡确实能硬解) 时，才开启 hwaccel
+            if using_gpu and not (is_mixed_mode and is_even_slot) and hw_decode_supported:
+                cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+            
+            # 增加 probesize 防止读取网络流时获取不到信息
+            if card.source_mode == "RAM":
+                cmd.extend(["-probesize", "32M", "-analyzeduration", "10M"])
+
+            cmd.extend(["-i", input_arg_final])
+                
+            if self.keep_meta_var.get():
+                cmd.extend(["-map_metadata", "0"])
+                
+            cmd.extend(["-c:v", v_codec])
+                
+            # 设置编码参数 (CRF/QP)
+            if using_gpu:
+                # 只有当它是全链路 GPU (解码+编码) 时，才需要用 scale_cuda
+                if hw_decode_supported and not (is_mixed_mode and is_even_slot):
+                    cmd.extend(["-vf", "scale_cuda=format=yuv420p"])
+                else:
+                    # CPU解码 -> GPU编码，需要手动转格式
+                    cmd.extend(["-pix_fmt", "yuv420p"])
+
+                # AV1 和 H264/5 的参数略有不同
+                if "AV1" in codec_sel:
+                     cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), "-preset", "p5", "-b:v", "0"]) 
+                else:
+                    cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), "-preset", "p6", "-b:v", "0"])
+            else:
+                # 纯 CPU 模式
+                cmd.extend(["-pix_fmt", "yuv420p"])
+                cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
+                cmd.extend(["-threads", "0"])
+                
+            cmd.extend(["-c:a", "copy", "-progress", "pipe:1", "-nostats", working_output_file])
+
+            # 获取总时长用于计算进度
+            duration = self.get_dur(input_file)
+            output_log = [] # [补全] 初始化日志列表
+                    
+            # 启动子进程
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=si)
+            self.active_procs.append(proc)
+                    
+            # 设置进程优先级
+            try:
+                p_val = {"常规": PRIORITY_NORMAL, "优先": PRIORITY_ABOVE, "极速": PRIORITY_HIGH}.get(self.priority_var.get(), PRIORITY_ABOVE)
+                h_sub = ctypes.windll.kernel32.OpenProcess(0x0100 | 0x0200, False, proc.pid)
+                if h_sub:
+                    ctypes.windll.kernel32.SetPriorityClass(h_sub, p_val)
+                    disable_power_throttling(h_sub)
+                    ctypes.windll.kernel32.CloseHandle(h_sub)
+            except: pass
+
+            # --- 循环读取 FFmpeg 输出 ---
+            progress_stats = {"fps": "0", "out_time_us": "0", "speed": "0x", "frame": "0"}
+            start_t = time.time()
+            last_ui_update_time = 0 
+                    
+            for line in proc.stdout:
+                if self.stop_flag: break
+                try: 
+                    line_str = line.decode('utf-8', errors='ignore').strip()
+                    if not line_str: continue
+                    output_log.append(line_str)
+            
+                    if "=" in line_str:
+                        for item in line_str.split():
+                            if "=" in item:
+                                k, v = item.split("=", 1)
+                                progress_stats[k] = v 
+                
+                        now = time.time()
+                        if now - last_ui_update_time > 0.3: # 限制刷新率
+                            current_fps = int(float(progress_stats.get("fps", 0)))
+                            us = int(progress_stats.get("out_time_us", 0))
+                            current_sec = us / 1000000.0
+                    
+                            prog = 0
+                            eta = "--:--"
+                            if duration > 0:
+                                prog = min(1.0, current_sec / duration)
+                                elap = now - start_t
+                                if prog > 0.001:
+                                    eta_sec = (elap / prog - elap)
+                                    eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
+                    
+                            # 计算实时压缩率
+                            current_ratio = 0
+                            if os.path.exists(working_output_file) and prog > 0.01:
+                                try:
+                                    out_size = os.path.getsize(working_output_file)
+                                    current_ratio = (out_size / (input_size * prog)) * 100 
+                                except: pass
+                    
+                            self.safe_update(ch_ui.update_data, current_fps, prog, eta, current_ratio)
+                            self.safe_update(card.set_progress, prog, COLOR_ACCENT)
+                            last_ui_update_time = now
+                except Exception: continue
+                    
+            proc.wait()
+            if proc in self.active_procs: self.active_procs.remove(proc)
+
+            # 判断任务结果
+            if self.stop_flag:
+                self.safe_update(card.set_status, "已停止", COLOR_PAUSED, STATE_PENDING)
+                # 如果是停止，不删除缓存，方便下次继续（或者你可以选择删除）
+            elif proc.returncode == 0:
+                self.safe_update(card.set_status, "完成", COLOR_SUCCESS, STATE_DONE)
+                self.safe_update(card.set_progress, 1.0, COLOR_SUCCESS)
+            else:
+                self.safe_update(card.set_status, "FFmpeg 报错", COLOR_ERROR, STATE_ERROR)
+                print("\n".join(output_log[-10:])) # 打印最后10行日志
+
+        except Exception as e:
+            print(f"Compute Error: {e}")
+            self.safe_update(card.set_status, "逻辑错误", COLOR_ERROR, STATE_ERROR)
         
         finally:
-            # 必须归还通道索引，否则下次任务没地方显示
-            if my_slot_idx is not None:
-                with self.slot_lock: 
-                    self.available_indices.append(my_slot_idx)
-                    self.available_indices.sort()
+            # [关键] 任务结束必须释放两样东西：
+            # 1. 内存 (Global RAM)
+            if task_file in GLOBAL_RAM_STORAGE:
+                 del GLOBAL_RAM_STORAGE[task_file]
+                 print(f"[RAM] Released memory for: {fname}")
+            
+            card.ram_cost = 0.0
+            
+            # 2. 归还通道号牌 (UI Slot)
+            self.safe_update(ch_ui.reset) # 清空 UI 显示
+            with self.slot_lock:
+                if slot_idx != -1:
+                    self.available_indices.append(slot_idx)
+                    self.available_indices.sort() # 排序，优先使用前面的通道
 
 # 程序入口
 if __name__ == "__main__":
