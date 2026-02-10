@@ -847,8 +847,6 @@ class UltraEncoderApp(DnDWindow):
         # 线程池：用于管理后台任务
         self.executor = ThreadPoolExecutor(max_workers=16) 
         self.submitted_tasks = set() 
-        self.preload_executor = ThreadPoolExecutor(max_workers=1) 
-        self.preloading_tasks = set() # 记录哪些文件正在预加载，防止重复提交
         self.temp_dir = ""
         self.manual_cache_path = None
         self.temp_files = set() # 临时文件列表，用于退出时清理
