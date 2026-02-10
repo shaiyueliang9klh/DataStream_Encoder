@@ -13,7 +13,6 @@ def check_and_install_dependencies():
         ("tkinterdnd2", "tkinterdnd2"),
         ("PIL", "pillow"),
         ("packaging", "packaging"),
-        ("psutil", "psutil"),
         ("uuid", "uuid")
     ]
     
@@ -66,7 +65,6 @@ from http import HTTPStatus
 from functools import partial # 函数工具，用来固定参数
 from collections import deque
 import uuid        # 用来生成唯一的Token，确保内存服务器的安全性
-import psutil      # 用来检测系统资源使用情况，辅助决策
 
 # =========================================================================
 # === 全局视觉配置 (决定软件长什么样) ===
@@ -209,49 +207,6 @@ def disable_power_throttling(process_handle=None):
             process_handle = ctypes.windll.kernel32.GetCurrentProcess()
         ctypes.windll.kernel32.SetProcessInformation(process_handle, ProcessPowerThrottling, ctypes.byref(state), ctypes.sizeof(state))
     except: pass
-
-# =========================================================================
-# === 内存流媒体服务器 (为了让FFmpeg能读取内存里的视频) ===
-# =========================================================================
-# 这一块比较复杂，原理是把自己伪装成一个网页服务器，把内存里的数据当做网页视频发给FFmpeg
-class RamHttpHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, format, *args): pass  # 禁用烦人的日志输出
-    
-    # 当FFmpeg请求数据时触发
-    def do_GET(self):
-        data = self.server.ram_data # 获取内存里的视频数据
-        if not data:
-            self.send_error(HTTPStatus.NOT_FOUND, "No data loaded")
-            return
-        file_size = len(data)
-        start, end = 0, file_size - 1
-        
-        # 处理断点续传（Range头），FFmpeg有时候会跳着读
-        if "Range" in self.headers:
-            range_header = self.headers["Range"]
-            try:
-                range_val = range_header.split("=")[1]
-                start_str, end_str = range_val.split("-")
-                if start_str: start = int(start_str)
-                if end_str: end = int(end_str)
-            except: pass
-        
-        chunk_len = (end - start) + 1
-        # 发送响应头
-        self.send_response(HTTPStatus.PARTIAL_CONTENT if "Range" in self.headers else HTTPStatus.OK)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-        self.send_header("Content-Length", str(chunk_len))
-        self.send_header("Accept-Ranges", "bytes")
-        self.end_headers()
-        
-        # 发送实际数据
-        try: self.wfile.write(data[start : end + 1])
-        except (ConnectionResetError, BrokenPipeError): pass
-
-# 多线程服务器类
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True 
 
 # [功能] 启动内存服务器
 def start_ram_server(ram_data):
@@ -1582,37 +1537,6 @@ class UltraEncoderApp(DnDWindow):
         self.safe_update(messagebox.showinfo, "完成", "所有任务处理完毕")
         self.safe_update(self.reset_ui_state)
 
-    # [新增] 硬件解码能力探针
-    # 原理：尝试用 GPU 解码第1帧，如果报错，说明不支持该格式（如 4:2:2 10bit）
-    def check_gpu_decode_capability(self, input_path):
-        try:
-            # 构建一个只解码不输出的测试命令
-            # -hwaccel cuda: 尝试调用 cuda 解码
-            # -vframes 1: 只解1帧，速度极快
-            # -f null -: 输出扔进黑洞
-            cmd = [
-                "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
-                "-i", input_path, "-vframes", "1", "-f", "null", "-"
-            ]
-            
-            # 隐藏黑框
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-            # 运行测试
-            ret = subprocess.run(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE, 
-                startupinfo=si,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            
-            # 返回码为0表示成功，非0表示显卡解不了
-            return (ret.returncode == 0)
-        except:
-            return False
-
     # --- [新增] 后勤兵：只负责 IO (读硬盘/写内存) ---
     def _worker_io_task(self, task_file):
         card = self.task_widgets[task_file]
@@ -1661,25 +1585,67 @@ class UltraEncoderApp(DnDWindow):
         
         return "❌ 未知错误 (建议检查输入文件是否损坏)"
 
-# =========================================================================
-    # === [V5.0 重构版] 核心计算任务：音频落地 + 视频内存流 ===
     # =========================================================================
+    # === [新增] 智能解码能力检测 (核心稳定性保障) ===
     # =========================================================================
-    # === [V6.0 终极修复版] 核心计算任务 ===
+    def check_decoding_capability(self, input_path):
+        """
+        返回一个字典:
+        {
+            "can_hw_decode": bool,  # 是否支持 GPU 解码
+            "pix_fmt": str,         # 像素格式 (如 yuv422p10le)
+            "codec_name": str       # 编码格式 (如 h264)
+        }
+        """
+        try:
+            # 1. 使用 ffprobe 获取视频流的详细像素格式
+            cmd = [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=pix_fmt,codec_name", 
+                "-of", "csv=p=0", input_path
+            ]
+            si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            output = subprocess.check_output(cmd, startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW).strip().decode('utf-8')
+            
+            parts = output.split(',')
+            codec_name = parts[0].strip()
+            pix_fmt = parts[1].strip() if len(parts) > 1 else ""
+
+            # 2. 硬编码黑名单 (NVIDIA NVDEC 目前不支持的格式)
+            # 索尼/佳能的 10-bit 4:2:2 是重灾区
+            unsupported_pix_fmts = [
+                "yuv422p10le", "yuv422p10be", # 10bit 4:2:2
+                "yuv422p12le", "yuv422p12be", # 12bit 4:2:2
+                "yuv444p10le", "yuv444p12le"  # 部分 4:4:4 也可能出问题
+            ]
+
+            # 3. 判断逻辑
+            can_hw_decode = True
+            if pix_fmt in unsupported_pix_fmts:
+                can_hw_decode = False
+                print(f"[Smart Check] 检测到高规格素材 ({pix_fmt})，将强制使用 CPU 解码以保证稳定。")
+            
+            return {"can_hw_decode": can_hw_decode, "pix_fmt": pix_fmt, "codec_name": codec_name}
+
+        except Exception as e:
+            print(f"[Check Error] 检测失败，默认回退到 CPU 解码: {e}")
+            return {"can_hw_decode": False, "pix_fmt": "unknown", "codec_name": "unknown"}
+
+    # =========================================================================
+    # === [V7.0 工业级重构版] 核心计算任务 (自动降级策略) ===
     # =========================================================================
     def _worker_compute_task(self, task_file):
-        # === 1. 变量初始化 (防止后面报错 undefined) ===
         card = self.task_widgets[task_file]
         fname = os.path.basename(task_file)
         slot_idx = -1
         ch_ui = None
         proc = None
         temp_audio_wav = os.path.join(self.temp_dir, f"TEMP_AUDIO_{uuid.uuid4().hex}.wav")
-        output_log = []     # 提前定义日志列表
-        input_size = 0      # 提前定义文件大小
-        duration = 1.0      # 提前定义时长，默认1秒防止除以零
+        output_log = []
+        input_size = 0
+        duration = 1.0
         
-        # 申请监控通道
+        # --- 资源申请 ---
         with self.slot_lock:
             if self.available_indices:
                 slot_idx = self.available_indices.pop(0)
@@ -1694,151 +1660,169 @@ class UltraEncoderApp(DnDWindow):
             ch_ui = DummyUI()
 
         try:
-            # 获取基础信息
+            # 0. 基础信息获取
             if os.path.exists(task_file):
                 input_size = os.path.getsize(task_file)
                 duration = self.get_dur(task_file)
                 if duration <= 0: duration = 1.0
 
+            # 1. 智能预检：判断是否需要音频分离 & 是否支持硬解
+            # 索尼素材必须分离音频，否则时间戳必挂
+            need_audio_extract = True 
+            
+            # 检测视频解码能力
+            decode_info = self.check_decoding_capability(task_file)
+            hw_decode_allowed = decode_info["can_hw_decode"]
+            
             # --- 阶段 1: 音频预处理 (WAV 落地) ---
-            self.safe_update(card.set_status, "🎵 提取音频...", COLOR_READING, STATE_ENCODING)
-            
-            extract_cmd = [
-                "ffmpeg", "-y", "-i", task_file, 
-                "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
-                "-f", "wav", temp_audio_wav
-            ]
-            
-            # 隐藏黑框执行音频提取
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            subprocess.run(extract_cmd, startupinfo=si, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            
             has_audio = False
-            if os.path.exists(temp_audio_wav) and os.path.getsize(temp_audio_wav) > 1024:
-                has_audio = True
+            if need_audio_extract:
+                self.safe_update(card.set_status, "🎵 提取音频...", COLOR_READING, STATE_ENCODING)
+                extract_cmd = [
+                    "ffmpeg", "-y", "-i", task_file, 
+                    "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
+                    "-f", "wav", temp_audio_wav
+                ]
+                si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                subprocess.run(extract_cmd, startupinfo=si, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                if os.path.exists(temp_audio_wav) and os.path.getsize(temp_audio_wav) > 1024:
+                    has_audio = True
 
-            # --- 阶段 2: 构建主压制命令 ---
-            self.safe_update(card.set_status, "▶️ 极速编码中...", COLOR_ACCENT, STATE_ENCODING)
+            # --- 阶段 2: 构建“自适应”压制命令 ---
+            self.safe_update(card.set_status, "▶️ 智能编码中...", COLOR_ACCENT, STATE_ENCODING)
             
-            # 准备参数
+            # 用户设置
             codec_sel = self.codec_var.get()
-            using_gpu = self.should_use_gpu(codec_sel)
+            using_gpu = self.gpu_var.get() # 用户总开关
             is_mixed_mode = self.hybrid_var.get()
             is_even_slot = (slot_idx % 2 == 0)
-            
-            # 确定视频源
+
+            # 决策链：最终是否开启硬件解码？
+            # 必须满足 3 个条件：
+            # 1. 用户开启 GPU 开关
+            # 2. 显卡物理支持该格式 (4:2:0)
+            # 3. 没有开启“异构分流”的 CPU 强制位
+            final_hw_decode = using_gpu and hw_decode_allowed
+            if is_mixed_mode and is_even_slot:
+                final_hw_decode = False # 异构模式下，偶数槽强制用 CPU 解码
+
+            # 决策链：最终是否开启硬件编码？
+            # 只要用户开了 GPU，我们就尽量用 GPU 编码 (NVENC)，这个兼容性很好
+            final_hw_encode = using_gpu
+
+            # --- 路径准备 ---
             input_video_source = task_file
-            if card.source_mode == "RAM":
+            # 只有在 CPU 解码模式下，才敢用 RAM 内存流
+            # 因为 NVIDIA 驱动读取 HTTP 流有时候会有 Bug，读本地文件最稳
+            if not final_hw_decode and card.source_mode == "RAM":
                 token = PATH_TO_TOKEN_MAP.get(task_file)
                 if token: input_video_source = f"http://127.0.0.1:{self.global_port}/{token}"
             elif card.source_mode == "SSD_CACHE" and card.ssd_cache_path:
                 input_video_source = card.ssd_cache_path
 
-            # 输出路径
-            f_name_no_ext = os.path.splitext(fname)[0]
             output_dir = os.path.dirname(task_file)
+            f_name_no_ext = os.path.splitext(fname)[0]
             working_output_file = os.path.join(output_dir, f"{f_name_no_ext}_Cinético.mp4")
 
+            # --- 组装 FFmpeg 命令 ---
             cmd = ["ffmpeg", "-y"]
             
-            # 硬件解码
-            hw_decode_supported = self.check_gpu_decode_capability(task_file) if using_gpu else False
-            if using_gpu and not (is_mixed_mode and is_even_slot) and hw_decode_supported:
+            # [A] 硬件解码参数 (Input Options)
+            if final_hw_decode:
+                # 只有确认支持 4:2:0 且用户开启时，才加这行
                 cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+                # 显存回收参数 (防止多任务炸显存)
+                cmd.extend(["-extra_hw_frames", "2"]) 
 
-            # 输入流参数
-            if card.source_mode == "RAM":
+            # [B] 输入文件
+            if not final_hw_decode and card.source_mode == "RAM":
                 cmd.extend(["-probesize", "50M", "-analyzeduration", "100M"])
-
-            cmd.extend(["-i", input_video_source])  # 输入 0: 视频
+            
+            cmd.extend(["-i", input_video_source])
             if has_audio:
-                cmd.extend(["-i", temp_audio_wav])  # 输入 1: 音频
+                cmd.extend(["-i", temp_audio_wav])
 
-            # 映射流
+            # [C] 映射流
             cmd.extend(["-map", "0:v:0"])
-            if has_audio:
-                cmd.extend(["-map", "1:a:0"])
+            if has_audio: cmd.extend(["-map", "1:a:0"])
+
+            # [D] 视频编码参数 (Output Options)
+            v_codec = "libx264" # 默认 fallback
             
-            # 视频编码参数
-            v_codec = "libx264"
-            if "H.265" in codec_sel: v_codec = "libx265"
-            elif "AV1" in codec_sel: v_codec = "libsvtav1"
-            
-            if using_gpu:
+            if final_hw_encode:
+                # === GPU 编码分支 (NVENC) ===
                 if "H.264" in codec_sel: v_codec = "h264_nvenc"
                 elif "H.265" in codec_sel: v_codec = "hevc_nvenc"
                 elif "AV1" in codec_sel: v_codec = "av1_nvenc"
                 cmd.extend(["-c:v", v_codec])
-                
-                if hw_decode_supported and not (is_mixed_mode and is_even_slot):
-                    cmd.extend(["-vf", "scale_cuda=format=yuv420p"])
+
+                # 关键：像素格式处理
+                if final_hw_decode:
+                    # 全链路 GPU：直接在显存内缩放/转换，性能最强
+                    cmd.extend(["-vf", "scale_cuda=format=yuv420p"]) 
                 else:
-                    cmd.extend(["-pix_fmt", "yuv420p"])
-                
+                    # 半链路 (CPU解->GPU压)：需要手动上传数据到 GPU
+                    # 索尼素材通常是 10bit 422，必须先转成 yuv420p 才能喂给 NVENC
+                    cmd.extend(["-pix_fmt", "yuv420p"]) 
+
+                # 码率控制
                 cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), "-b:v", "0"])
-                if "AV1" not in codec_sel: cmd.extend(["-preset", "p6"])
+                if "AV1" not in codec_sel: cmd.extend(["-preset", "p4"]) # P4 是速度/画质平衡点
+            
             else:
+                # === CPU 编码分支 (x264/x265) ===
+                if "H.265" in codec_sel: v_codec = "libx265"
+                elif "AV1" in codec_sel: v_codec = "libsvtav1"
                 cmd.extend(["-c:v", v_codec, "-pix_fmt", "yuv420p", "-crf", str(self.crf_var.get()), "-preset", "medium"])
 
-            # 音频编码参数
+            # [E] 音频编码参数
             if has_audio:
                 cmd.extend(["-c:a", "aac", "-b:a", "320k"])
-            
+
+            # [F] 杂项
             if self.keep_meta_var.get(): cmd.extend(["-map_metadata", "0"])
             cmd.extend(["-progress", "pipe:1", "-nostats", working_output_file])
 
-            # --- 阶段 3: 启动进程与监控 ---
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            # 关键：分离 stdout(进度) 和 stderr(报错)
+            # --- 阶段 3: 执行与监控 ---
+            si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=si)
             self.active_procs.append(proc)
-            
-            # 启动后台线程记录 stderr 报错信息
+
+            # 错误日志捕获线程
             def log_stderr(p):
                 for l in p.stderr:
-                    try: 
-                        txt = l.decode('utf-8', errors='ignore').strip()
-                        if txt: output_log.append(txt)
+                    try: output_log.append(l.decode('utf-8', errors='ignore').strip())
                     except: pass
             threading.Thread(target=log_stderr, args=(proc,), daemon=True).start()
-            
-            tag_info = "GPU + WAV Audio" if using_gpu else "CPU + WAV Audio"
+
+            # 生成 UI 标签文字
+            info_decode = "GPU" if final_hw_decode else "CPU"
+            info_encode = "GPU" if final_hw_encode else "CPU"
+            tag_info = f"Dec:{info_decode} | Enc:{info_encode}"
+            if card.source_mode == "RAM": tag_info += " | RAM"
             self.safe_update(ch_ui.activate, fname, tag_info)
 
-            # --- 阶段 4: UI 数据解析循环 ---
+            # --- 阶段 4: 进度解析循环 (保持原有逻辑) ---
             progress_stats = {}
             start_t = time.time()
             last_ui_update_time = 0 
-
+            
             for line in proc.stdout:
                 if self.stop_flag: break
                 try: 
                     line_str = line.decode('utf-8', errors='ignore').strip()
                     if not line_str: continue
-                    
                     if "=" in line_str:
                         key, value = line_str.split("=", 1)
                         progress_stats[key.strip()] = value.strip()
-                        
                         if key.strip() == "out_time_us":
-                            val_str = value.strip()
-                            if not val_str.isdigit(): continue # 过滤 N/A
-
                             now = time.time()
                             if now - last_ui_update_time > 0.2:
-                                # 安全解析 FPS
-                                try: 
-                                    fps = float(progress_stats.get("fps", "0"))
-                                except: 
-                                    fps = 0.0
-                                
-                                # 计算进度
-                                current_us = int(val_str)
+                                fps = float(progress_stats.get("fps", "0")) if "fps" in progress_stats else 0.0
+                                current_us = int(value.strip())
                                 prog = min(1.0, (current_us / 1000000.0) / duration)
                                 
-                                # 计算 ETA
+                                # ETA 计算
                                 eta = "--:--"
                                 elapsed = now - start_t
                                 if prog > 0.005:
@@ -1846,24 +1830,22 @@ class UltraEncoderApp(DnDWindow):
                                     if eta_sec < 0: eta_sec = 0
                                     eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
                                 
-                                # 计算压缩率
+                                # 压缩率计算
                                 ratio = 0.0
                                 if os.path.exists(working_output_file) and prog > 0.01:
-                                    try:
-                                        curr_size = os.path.getsize(working_output_file)
-                                        in_proc = input_size * prog
-                                        if in_proc > 0: ratio = (curr_size / in_proc) * 100
-                                    except: pass
-                                
+                                    curr_size = os.path.getsize(working_output_file)
+                                    in_proc = input_size * prog
+                                    if in_proc > 0: ratio = (curr_size / in_proc) * 100
+
                                 self.safe_update(ch_ui.update_data, fps, prog, eta, ratio)
                                 self.safe_update(card.set_progress, prog, COLOR_ACCENT)
                                 last_ui_update_time = now
                 except: pass
-
+            
             proc.wait()
             if proc in self.active_procs: self.active_procs.remove(proc)
 
-            # 善后与错误处理
+            # 善后
             if os.path.exists(temp_audio_wav):
                 try: os.remove(temp_audio_wav)
                 except: pass
@@ -1874,19 +1856,17 @@ class UltraEncoderApp(DnDWindow):
                 self.safe_update(card.set_status, "完成", COLOR_SUCCESS, STATE_DONE)
                 self.safe_update(card.set_progress, 1.0, COLOR_SUCCESS)
             else:
-                # 这里 output_log 绝对有值了，因为是在函数最开头定义的
-                print(f"Error Log Last 20 lines:\n" + "\n".join(output_log[-20:]))
+                # 打印错误日志分析
+                err_msg = self.analyze_ffmpeg_log(output_log)
+                print(f"Task Failed: {fname}\nReason: {err_msg}")
                 self.safe_update(card.set_status, "转码失败", COLOR_ERROR, STATE_ERROR)
-                
-                err_msg = "\n".join(output_log[-10:]) if output_log else "无详细日志"
-                self.safe_update(messagebox.showerror, "错误", f"FFmpeg 异常退出。\n\n最后日志:\n{err_msg}")
+                self.safe_update(messagebox.showerror, "错误", f"处理 {fname} 时发生错误：\n{err_msg}")
 
         except Exception as e:
             print(f"Critical System Error: {e}")
             self.safe_update(card.set_status, "系统错误", COLOR_ERROR, STATE_ERROR)
         
         finally:
-            # 清理内存
             token = PATH_TO_TOKEN_MAP.get(task_file)
             if token and token in GLOBAL_RAM_STORAGE:
                  del GLOBAL_RAM_STORAGE[token]
