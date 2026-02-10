@@ -208,17 +208,6 @@ def disable_power_throttling(process_handle=None):
         ctypes.windll.kernel32.SetProcessInformation(process_handle, ProcessPowerThrottling, ctypes.byref(state), ctypes.sizeof(state))
     except: pass
 
-# [功能] 启动内存服务器
-def start_ram_server(ram_data):
-    # 端口设为0，表示让系统自动分配一个空闲端口
-    server = ThreadedHTTPServer(('127.0.0.1', 0), RamHttpHandler)
-    server.ram_data = ram_data
-    port = server.server_address[1] # 获取实际分配的端口
-    # 在单独的线程里运行服务器，不卡主界面
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, port, thread
-
 # [功能] 检查FFmpeg是否安装
 def check_ffmpeg():
     try:
@@ -847,8 +836,6 @@ class UltraEncoderApp(DnDWindow):
         # 线程池：用于管理后台任务
         self.executor = ThreadPoolExecutor(max_workers=16) 
         self.submitted_tasks = set() 
-        self.preload_executor = ThreadPoolExecutor(max_workers=1) 
-        self.preloading_tasks = set() # 记录哪些文件正在预加载，防止重复提交
         self.temp_dir = ""
         self.manual_cache_path = None
         self.temp_files = set() # 临时文件列表，用于退出时清理
@@ -1357,12 +1344,9 @@ class UltraEncoderApp(DnDWindow):
         # 2. 重置线程池（防止旧任务僵死）
         self.executor.shutdown(wait=False)
         self.executor = ThreadPoolExecutor(max_workers=16)
-        self.preload_executor.shutdown(wait=False)
-        self.preload_executor = ThreadPoolExecutor(max_workers=1)
         
         # 3. 清理内部队列
         self.submitted_tasks.clear()
-        self.preloading_tasks.clear()
         self.gpu_active_count = 0
         
         # 4. 重置通道资源
