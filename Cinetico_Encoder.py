@@ -568,170 +568,206 @@ class TaskCard(ctk.CTkFrame):
         self.ssd_cache_path = None
 
 # =========================================================================
-# === [V4.1 修复版] 专家手册：无引用标记污染，纯净代码 ===
+# === [V5.2 最终版] 帮助窗口：全卡片式统一排版 ===
 # =========================================================================
 class HelpWindow(ctk.CTkToplevel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.geometry("1150x900") 
-        self.title("Cinético - 架构白皮书")
-        # 修复：防止窗口在某些情况下被主窗口遮挡，但允许用户最小化
+        self.title("Cinético - Technical Guide")
         self.attributes("-topmost", True)
         self.lift()
         self.focus_force()
         
-        # 1. 顶部标题区
-        header = ctk.CTkFrame(self, height=80, fg_color="transparent")
-        header.pack(fill="x", padx=30, pady=25)
+        # --- 字体配置 (保持大字号) ---
+        self.FONT_H1 = ("Segoe UI", 34, "bold")      
+        self.FONT_H2 = ("微软雅黑", 18)              
+        self.FONT_SEC = ("Segoe UI", 22, "bold")     
+        self.FONT_SEC_CN = ("微软雅黑", 16, "bold")  
+        self.FONT_ITEM = ("Segoe UI", 16, "bold")    # 稍微再加大一点标题
+        self.FONT_BODY_EN = ("Segoe UI", 13)         
+        self.FONT_BODY_CN = ("微软雅黑", 13)         
         
-        # 左侧标题
-        title_box = ctk.CTkFrame(header, fg_color="transparent")
-        title_box.pack(side="left")
-        ctk.CTkLabel(title_box, text="ULTRA ARCHITECTURE", font=("Impact", 32), text_color="#444").pack(anchor="w")
-        ctk.CTkLabel(title_box, text="高性能计算架构与操作指南", font=("微软雅黑", 20, "bold"), text_color="#FFF").pack(anchor="w")
-        
-        # 右侧版本号
-        ctk.CTkLabel(header, text="Kernel: v75.0\nDoc: v4.1", font=("Consolas", 12), text_color="#666", justify="right").pack(side="right")
+        # 颜色配置
+        self.COL_BG = "#121212"        
+        self.COL_CARD = "#1E1E1E"      
+        self.COL_TEXT_HI = "#FFFFFF"   
+        self.COL_TEXT_MED = "#CCCCCC"  
+        self.COL_TEXT_LOW = "#888888"  
+        self.COL_ACCENT = "#3B8ED0"    
 
-        # 2. 滚动内容区
+        self.configure(fg_color=self.COL_BG)
+
+        # --- 顶部标题区 ---
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=50, pady=(45, 25))
+        
+        ctk.CTkLabel(header, text="Cinético Technical Overview & Operation Guide", 
+                     font=self.FONT_H1, text_color=self.COL_TEXT_HI, anchor="w").pack(fill="x")
+        ctk.CTkLabel(header, text="Cinético 技术概览与操作指南", 
+                     font=self.FONT_H2, text_color=self.COL_TEXT_LOW, anchor="w").pack(fill="x", pady=(8, 0))
+
+        # --- 滚动内容区 ---
         self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.scroll.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.scroll.pack(fill="both", expand=True, padx=30, pady=(0, 30))
 
         # =======================
-        # 第一部分：四大核心黑科技
+        # Part I: Functional Modules
         # =======================
-        self.add_section_header("🌌 核心架构：为什么 Cinético 如此之快？", "#E67E22")
-        
-        feature_frame = ctk.CTkFrame(self.scroll, fg_color="transparent")
-        feature_frame.pack(fill="x", padx=10, pady=10)
-        # 修复：配置权重，防止卡片挤在一起
-        feature_frame.grid_columnconfigure(0, weight=1)
-        feature_frame.grid_columnconfigure(1, weight=1)
+        self.add_section_title("I. Functional Modules Detail", "功能模块详解")
+        self.add_desc_text("Cinético is designed to deliver industrial-grade video processing capabilities through minimalist interaction logic.\nCinético 旨在通过极简的交互逻辑提供工业级的视频处理能力。")
 
-        # 特性 1
-        self.create_feature_card(feature_frame, 0, 0, 
-            "⚡ Zero-Copy Loopback (零拷贝环回)",
-            "传统软件读写硬盘会产生巨大的 I/O 中断延迟。本引擎内置微型 HTTP Server，建立本地环回链路。视频数据被直接映射到 RAM 内存空间，以 12GB/s 的总线速度直接投喂给编码器，彻底消除机械硬盘瓶颈。"
+        # 1. Core Processing
+        self.add_sub_header("1. Core Processing / 核心处理")
+        self.add_item_block(
+            "Hardware Acceleration / GPU ACCEL", "硬件加速",
+            "Utilizes dedicated NVIDIA NVENC circuits for hardware encoding. Significantly improves throughput and reduces power consumption. Disable only for benchmarking or troubleshooting compatibility issues.",
+            "调用 NVIDIA NVENC 专用电路进行硬件编码。显著提升吞吐量，降低能耗。仅在基准测试或排查兼容性问题时关闭。"
         )
-        # 特性 2
-        self.create_feature_card(feature_frame, 0, 1, 
-            "🔄 Tiered Storage Tiering (分层存储调度)",
-            "独创的热数据分层算法。引擎自动探测系统空闲 RAM 和 SSD 缓存池。小于阈值的文件驻留内存，大文件自动降级至 NVMe SSD 缓存。实现“内存级速度，硬盘级容量”的混合加速。"
-        )
-        # 特性 3
-        self.create_feature_card(feature_frame, 1, 0, 
-            "🛡️ Kernel-Level QoS (内核级进程治理)",
-            "直接调用 Windows Kernel API (SetThreadExecutionState)，接管电源管理策略。强制 CPU 进入高能效状态，防止系统降频或休眠。配合多线程 Spinlock 锁机制，杜绝界面假死。"
-        )
-        # 特性 4
-        self.create_feature_card(feature_frame, 1, 1, 
-            "🧠 Heuristic VRAM Guard (启发式显存哨兵)",
-            "实时监控 GPU 显存拓扑。不同于简单的“报错退出”，本引擎能动态预测下一个任务的显存开销。当 VRAM 不足时自动挂起队列，实现“流水线式”的显存复用，压榨显卡最后 1MB 性能。"
-        )
-        # 在 self.scroll 中增加第 5 个特性卡片
-        self.create_feature_card(feature_frame, 2, 0, 
-            "🚀 Heterogeneous Hybrid Decoupling (异构解码分流)",
-            "开启后，偶数通道将解码压力分流至 CPU，从而解除显卡单解码器 (NVDEC) 的竞争瓶颈。配合 NVENC 双编码核心，可实现总吞吐量 (Total FPS) 提升约 30%-50%。"
+        self.add_item_block(
+            "Heterogeneous Offloading / HYBRID", "异构分流",
+            "A load balancing strategy. When enabled, it forces CPU decoding while using GPU encoding. Optimizes pipeline efficiency during concurrent multi-tasking.",
+            "负载均衡策略。开启后，将强制使用 CPU 解码，使用GPU 编码。可优化多任务并发流水线效率。"
         )
 
-        # =======================
-        # 第二部分：编码格式
-        # =======================
-        self.add_section_header("🎞️编码标准深度对标 (Codec)", "#00E676")
-        self.add_tip("技术指标基于《2026全球视频编码技术全景报告》")
+        # 2. Codec Standards
+        self.add_sub_header("2. Codec Standards / 编码标准")
+        self.add_item_block(
+            "H.264 (AVC)", "",
+            "Extensive device support. Suitable for cross-platform distribution, client delivery, or playback on legacy hardware. Ensures maximum compatibility.",
+            "广泛的设备支持。适用于跨平台分发、交付客户或在老旧硬件上播放。确保最大的兼容性。"
+        )
+        self.add_item_block(
+            "H.265 (HEVC)", "",
+            "High compression ratio. At equivalent image quality, bitrate is reduced by approximately 50% compared to H.264. Suitable for storage and archiving of 4K high-resolution video.",
+            "高压缩比。在同等画质下，比特率较 H.264 降低约 50%。适用于 4K 高分辨率视频的存储与归档。"
+        )
+        self.add_item_block(
+            "AV1", "",
+            "Next-generation open-source coding format with superior compression efficiency. Suitable for scenarios requiring extreme file size control; encoding duration is longer, and playback requires hardware support.",
+            "新一代开源编码格式，具备更优异的压缩效率。适用于对体积控制有极高要求的场景，编码耗时长，播放端需硬件支持。"
+        )
 
-        codec_data = [
-            ("标准代号", "压缩算法效率", "硬件生态现状", "编码延迟", "专家决策建议"),
-            ("H.264 (AVC)", "基准 (100%)", "👑 100% 覆盖", "🚀 < 100ms", "兼容性之王。任何能点亮的屏幕都能播。适合交付给客户、老旧设备播放或极低延迟场景。"),
-            ("H.265 (HEVC)", "节省 ~50%", "⭐️ 主流标配", "⚡ 中等", "4K/HDR 时代的基石。同画质下体积减半。适合NAS收藏、节省硬盘。Win10/11 需扩展支持。"),
-            ("AV1", "节省 ~65%", "📈 快速增长", "🐢 较高", "来自互联网巨头的免版税格式。Netflix/YouTube首选。画质无敌，但需 RTX30/40 或新处理器支持硬解。"),
-        ]
-        self.create_grid_table(codec_data, col_weights=[1, 1, 1, 1, 4])
-
-        # =======================
-        # 第三部分：画质控制
-        # =======================
-        self.add_section_header("🎨 量化画质控制 (CRF Rate Control)", "#3B8ED0")
+        # 3. Image Quality (修改为统一卡片风格)
+        self.add_sub_header("3. Image Quality Quantization / 画质量化")
+        self.add_desc_text("Uses CRF for image quality control. / 以 CRF 进行画质控制。")
         
-        crf_data = [
-            ("CRF 数值", "视觉质量等级", "比特率 (Bitrate)", "工业级应用场景"),
-            ("16 - 19", "💎 Archival (归档级)", "超高 (100%)", "作为后期剪辑的中间素材 (Mezzanine)、永久保存的珍贵录像。肉眼无法区分原片。"),
-            ("20 - 24", "⚖️ High Profile (推荐)", "高 (50%)", "【默认值 23】。完美平衡点。适合上传 B站/YouTube 4K，在此数值上继续降低很难察觉画质提升。"),
-            ("25 - 30", "📱 Mobile (移动级)", "中 (25%)", "适合手机小屏幕观看、网课录屏、会议记录。在移动设备上观看依然清晰，体积优势巨大。"),
-            ("31 - 35", "📉 Proxy (代理级)", "低 (10%)", "仅用于内部预览、监控录像归档。动态画面会有明显的块状伪影 (Artifacts)。"),
-        ]
-        self.create_grid_table(crf_data, col_weights=[1, 1, 1, 4])
+        self.add_item_block(
+            "18 - 19", "Visually Lossless / 视觉无损",
+            "Visually Lossless. Retains complete image detail; suitable for raw footage backup.",
+            "视觉无损。保留完整的画面细节，适用于原始素材备份。"
+        )
+        self.add_item_block(
+            "20 - 24", "Balanced Preset / 平衡预设",
+            "Balanced Preset. Strikes a balance between visual fidelity and file size; suitable for mainstream streaming platforms.",
+            "平衡预设。在视觉保真度与文件体积之间取得平衡，适用于主流流媒体平台。"
+        )
+        self.add_item_block(
+            "25 - 30", "High Compression / 高压缩率",
+            "High Compression Rate. Good visual quality on mobile screens; significantly reduces storage usage.",
+            "高压缩率。在移动设备屏幕上观感良好，显著降低存储占用。"
+        )
+
+        # 4. System Scheduling
+        self.add_sub_header("4. System Scheduling / 系统调度")
+        self.add_item_block(
+            "Retain Metadata / KEEP DATA", "保留元数据",
+            "Retains original shooting parameters, timestamps, and camera information during encapsulation.",
+            "封装时保留原片的拍摄参数、时间戳及相机信息。"
+        )
+        self.add_item_block(
+            "Concurrent Tasks / CONCURRENCY", "并发任务",
+            "Adjusts the number of parallel processing tasks based on VRAM capacity.",
+            "根据显存容量调整并行处理的任务数量。"
+        )
+        self.add_item_block(
+            "Process Priority / PRIORITY", "进程优先级",
+            "Normal: Standard scheduling.\nHigh: Aggressive scheduling. Allocates maximum CPU time slices to the encoding process to accelerate compression, but significantly occupies system resources.",
+            "Normal：标准调度。\nHigh：激进调度。向编码进程分配最大化的 CPU 时间片，加速压制，但显著占用系统资源。可能影响其他应用响应速度。"
+        )
 
         # =======================
-        # 第四部分：硬件调度
+        # Part II: Core Architecture
         # =======================
-        self.add_section_header("⚙️ 异构计算调度策略 (Heterogeneous Computing)", "#9B59B6")
+        self.add_separator()
+        self.add_section_title("II. Core Architecture Analysis", "核心架构解析")
+        self.add_desc_text("Cinético has reconstructed underlying data transmission and resource management to break through the performance bottlenecks of traditional transcoding tools.\nCinético 重构底层数据传输与资源管理，突破传统转码工具性能瓶颈。")
+
+        self.add_item_block(
+            "1. Zero-Copy Loopback", "零拷贝环回",
+            "Maps video streams to RAM; the encoder bypasses the conventional file system to acquire data at memory bus speeds, eliminating mechanical hard drive seek latency.",
+            "将视频流映射至 RAM，编码器绕过常规文件系统，以内存总线速度获取数据，消除机械硬盘的寻道延迟。"
+        )
+
+        self.add_item_block(
+            "2. Adaptive Storage Tiering", "自适应分层存储",
+            "Dynamically allocates caching strategies based on file size and hardware environment.\n· Small files reside in memory for instant reading.\n· Large files are scheduled to SSD to ensure read/write stability.",
+            "根据文件体积与硬件环境动态分配缓存策略。\n· 小文件驻留内存即时读取。\n· 大文件调度至SSD确保读写稳定性。"
+        )
+
+        self.add_item_block(
+            "3. Heuristic VRAM Guard", "显存启发式管理",
+            "A protection mechanism designed for high-load scenarios. Automatically suspends operations when VRAM resources approach the threshold, ensuring stability under extreme operating conditions.",
+            "针对高负载场景设计的保护机制。显存资源临近阈值自动挂起，确保极端工况稳定性。"
+        )
+
+        # 底部留白
+        ctk.CTkFrame(self.scroll, height=60, fg_color="transparent").pack()
+
+    # --- 辅助方法：添加分隔线 ---
+    def add_separator(self):
+        line = ctk.CTkFrame(self.scroll, height=2, fg_color="#333333")
+        line.pack(fill="x", padx=20, pady=50)
+
+    # --- 辅助方法：添加大章节标题 ---
+    def add_section_title(self, text_en, text_cn):
+        f = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        f.pack(fill="x", padx=20, pady=(35, 15))
         
-        hw_data = [
-            ("计算单元", "核心架构优势", "潜在物理瓶颈", "调度引擎建议"),
-            ("NVIDIA GPU", "NVENC 专用电路\n不占用 CUDA 核心", "同码率下画质\n微弱于 CPU (VMAF-1%)", "✅【强制开启】。能效比是 CPU 的 10 倍以上。建议并发数设为 2-3 个以跑满带宽。"),
-            ("Intel/AMD CPU", "复杂指令集 (AVX)\n画质控制最精准", "浮点算力不足\n导致系统卡顿/过热", "❌ 仅作为故障转移 (Failover)。本程序已通过 SetPriorityClass 限制线程，防止死机。"),
-        ]
-        self.create_grid_table(hw_data, col_weights=[1, 2, 2, 4])
-
-        ctk.CTkLabel(self.scroll, text="Designed by Cinético Team | Powered by FFmpeg & Python", font=("Arial", 10), text_color="#333").pack(pady=30)
-
-    # --- 组件：特性卡片 ---
-    def create_feature_card(self, parent, r, c, title, text):
-        card = ctk.CTkFrame(parent, fg_color="#222", corner_radius=10, border_width=1, border_color="#333")
-        card.grid(row=r, column=c, padx=10, pady=10, sticky="nsew")
+        bar = ctk.CTkFrame(f, width=5, height=28, fg_color=self.COL_ACCENT)
+        bar.pack(side="left", padx=(0, 15))
         
-        ctk.CTkLabel(card, text=title, font=("微软雅黑", 14, "bold"), text_color="#EEE", anchor="w").pack(fill="x", padx=15, pady=(15, 5))
-        ctk.CTkLabel(card, text=text, font=("微软雅黑", 12), text_color="#AAA", anchor="w", justify="left", wraplength=450).pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        ctk.CTkLabel(f, text=text_en, font=self.FONT_SEC, text_color=self.COL_TEXT_HI).pack(side="left", anchor="sw")
+        ctk.CTkLabel(f, text=f"  {text_cn}", font=self.FONT_SEC_CN, text_color=self.COL_TEXT_LOW).pack(side="left", anchor="sw", pady=(3,0))
 
-    # --- 组件：带色块的标题 ---
-    def add_section_header(self, text, color):
-        frame = ctk.CTkFrame(self.scroll, fg_color="transparent")
-        frame.pack(fill="x", padx=15, pady=(35, 15))
-        bar = ctk.CTkFrame(frame, width=6, height=28, fg_color=color, corner_radius=3)
-        bar.pack(side="left", padx=(5, 12))
-        lbl = ctk.CTkLabel(frame, text=text, font=("微软雅黑", 18, "bold"), text_color=color)
-        lbl.pack(side="left")
+    # --- 辅助方法：添加子分类标题 ---
+    def add_sub_header(self, text):
+        ctk.CTkLabel(self.scroll, text=text, font=self.FONT_SEC_CN, text_color=self.COL_TEXT_HI, anchor="w")\
+            .pack(fill="x", padx=40, pady=(30, 12))
 
-    # --- 组件：小提示 ---
-    def add_tip(self, text):
-        lbl = ctk.CTkLabel(self.scroll, text=text, font=("Consolas", 11), text_color="#666", anchor="w")
-        lbl.pack(fill="x", padx=45, pady=(0, 10))
+    # --- 辅助方法：添加纯文本描述 ---
+    def add_desc_text(self, text):
+        ctk.CTkLabel(self.scroll, text=text, font=self.FONT_BODY_EN, text_color=self.COL_TEXT_MED, 
+                     justify="left", anchor="w").pack(fill="x", padx=40, pady=(0, 20))
 
-    # --- 核心组件：绝对对齐的网格表格 ---
-    def create_grid_table(self, data, col_weights):
-        # 表格容器
-        table_frame = ctk.CTkFrame(self.scroll, fg_color="#181818", corner_radius=10, border_width=1, border_color="#333")
-        table_frame.pack(fill="x", padx=20, pady=5)
+    # --- 辅助方法：添加功能卡片 ---
+    def add_item_block(self, title_en, title_cn, body_en, body_cn):
+        card = ctk.CTkFrame(self.scroll, fg_color=self.COL_CARD, corner_radius=8)
+        card.pack(fill="x", padx=20, pady=10)
         
-        # 1. 配置列宽权重
-        for i, w in enumerate(col_weights):
-            table_frame.grid_columnconfigure(i, weight=w)
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="both", padx=25, pady=20)
+        
+        # 标题行
+        title_box = ctk.CTkFrame(inner, fg_color="transparent")
+        title_box.pack(fill="x", pady=(0, 10))
+        
+        t1 = ctk.CTkLabel(title_box, text=title_en, font=self.FONT_ITEM, text_color=self.COL_TEXT_HI)
+        t1.pack(side="left")
+        
+        if title_cn:
+            # 这里的文字颜色改为 Accent Color (蓝色)，让小标题更醒目，
+            # 同时也区分了左边的纯英文大标题
+            t2 = ctk.CTkLabel(title_box, text=f"  {title_cn}", font=self.FONT_ITEM, text_color=self.COL_ACCENT)
+            t2.pack(side="left")
 
-        # 2. 填充数据
-        for r_idx, row_data in enumerate(data):
-            is_header = (r_idx == 0)
-            bg_color = "#2D2D2D" if is_header else ("#202020" if r_idx % 2 == 1 else "transparent")
-            text_color = "#FFFFFF" if is_header else "#CCCCCC"
-            font = ("微软雅黑", 13, "bold") if is_header else ("微软雅黑", 12)
-            
-            for c_idx, text in enumerate(row_data):
-                # 最后一列左对齐，其他居中
-                align = "center" if c_idx == 0 else "w"
-                pad_x = 20 if align == "w" else 5
-                
-                cell_frame = ctk.CTkFrame(table_frame, fg_color=bg_color, corner_radius=0)
-                cell_frame.grid(row=r_idx, column=c_idx, sticky="nsew", padx=1, pady=1)
-                
-                label = ctk.CTkLabel(
-                    cell_frame, 
-                    text=text, 
-                    font=font, 
-                    text_color=text_color,
-                    anchor=align,
-                    justify="left"
-                )
-                label.pack(fill="both", expand=True, padx=pad_x, pady=10)
+        # 内容行 (英文)
+        ctk.CTkLabel(inner, text=body_en, font=self.FONT_BODY_EN, text_color=self.COL_TEXT_MED, 
+                     justify="left", anchor="w", wraplength=950).pack(fill="x", pady=(0, 6))
+        
+        # 内容行 (中文)
+        ctk.CTkLabel(inner, text=body_cn, font=self.FONT_BODY_CN, text_color=self.COL_TEXT_LOW, 
+                     justify="left", anchor="w", wraplength=950).pack(fill="x")
 
 # =========================================================================
 # === 主程序类 (核心逻辑都在这) ===
