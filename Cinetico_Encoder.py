@@ -631,7 +631,7 @@ class HelpWindow(ctk.CTkToplevel):
         self.FONT_H2 = ("微软雅黑", 18)              
         self.FONT_SEC = ("Segoe UI", 22, "bold")     
         self.FONT_SEC_CN = ("微软雅黑", 16, "bold")  
-        self.FONT_ITEM = ("Segoe UI", 16, "bold")    # 稍微再加大一点标题
+        self.FONT_ITEM = ("Segoe UI", 16, "bold")    
         self.FONT_BODY_EN = ("Segoe UI", 13)         
         self.FONT_BODY_CN = ("微软雅黑", 13)         
         
@@ -642,6 +642,7 @@ class HelpWindow(ctk.CTkToplevel):
         self.COL_TEXT_MED = "#CCCCCC"  
         self.COL_TEXT_LOW = "#888888"  
         self.COL_ACCENT = "#3B8ED0"    
+        self.COL_TIP    = "#F1C40F"    # 建议高亮色
 
         self.configure(fg_color=self.COL_BG)
 
@@ -657,6 +658,29 @@ class HelpWindow(ctk.CTkToplevel):
         # --- 滚动内容区 ---
         self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.scroll.pack(fill="both", expand=True, padx=30, pady=(0, 30))
+
+        # =======================
+        # [NEW] Part 0: Smart Hardware Advice
+        # =======================
+        self.add_section_title("0. Smart Optimization Guide", "智能并发设置建议")
+        self.add_desc_text("Based on your current hardware configuration, here are the recommended settings for maximum efficiency without system freeze.\n根据您当前的硬件配置，以下是防止卡顿并最大化效率的推荐设置。")
+        
+        # 获取建议
+        cpu_advice, gpu_advice = self.get_hardware_advice()
+        
+        # 显示 CPU 建议
+        self.add_item_block(
+            "CPU Encoding Mode (x264/x265/AV1)", "CPU 纯软解压制",
+            f"Your CPU has multiple cores. To prevent system lag, do not use all threads.\n{cpu_advice['en']}",
+            f"您的处理器核心较多。为防止系统卡死，请勿占满所有线程。\n建议：{cpu_advice['cn']}"
+        )
+
+        # 显示 GPU 建议
+        self.add_item_block(
+            "GPU Acceleration Mode (NVENC)", "N卡 硬件加速压制",
+            f"Depends on the number of NVENC chips on your graphics card.\n{gpu_advice['en']}",
+            f"取决于您显卡上的 NVENC 编码芯片数量。\n建议：{gpu_advice['cn']}"
+        )
 
         # =======================
         # Part I: Functional Modules
@@ -695,8 +719,8 @@ class HelpWindow(ctk.CTkToplevel):
             "新一代开源编码格式，具备更优异的压缩效率。适用于对体积控制有极高要求的场景，编码耗时长，播放端需硬件支持。"
         )
 
-        # [新增] 2.5 Color Depth / 色彩深度
-        self.add_separator() # 加条分割线区分一下
+        # 2.5 Color Depth / 色彩深度
+        self.add_separator()
         self.add_sub_header("2.5 Color Depth / 色彩深度")
         
         self.add_item_block(
@@ -711,8 +735,7 @@ class HelpWindow(ctk.CTkToplevel):
             "10.7 亿色。彻底消除色彩断层，提升渐变色区域压缩效率。\n建议：存档或追求高画质时务必开启。"
         )
 
-        # [修改] 3. Image Quality Quantization / 画质量化
-        # 文案风格：技术性、简洁、无修辞
+        # 3. Rate Control & Quality
         self.add_sub_header("3. Rate Control & Quality / 码率控制与画质")
         self.add_desc_text("The quantization strategy adapts automatically based on the hardware selection.\n量化策略根据硬件选择自动适配。")
         
@@ -776,8 +799,76 @@ class HelpWindow(ctk.CTkToplevel):
             "针对高负载场景设计的保护机制。显存资源临近阈值自动挂起，确保极端工况稳定性。"
         )
 
-        # 底部留白
         ctk.CTkFrame(self.scroll, height=60, fg_color="transparent").pack()
+
+    # [NEW] 修正版：基于 UI 限制和实战体验的建议
+    def get_hardware_advice(self):
+        import subprocess
+        import os
+        
+        # --- 1. CPU 智能建议 (修正版) ---
+        # 核心逻辑：UI 上限只有 4。
+        # 对于 10-bit 压制，内存带宽是瓶颈，并发过多会导致 L3 缓存未命中率飙升，反而变慢。
+        # 即使是 32 线程的 CPU，跑 3-4 个高负载任务也已经是甜点区了。
+        try:
+            cpu_count = os.cpu_count() or 4
+        except:
+            cpu_count = 4
+            
+        if cpu_count >= 16:
+            # 16 线程以上 (i7/i9/R9)：性能过剩。
+            # 推荐 3 个是为了留有余量给系统，用起来最丝滑；推荐 4 个是极限压榨。
+            # 我们这里采取"甜点"策略，推荐 3 或 4。
+            rec_cpu = 3 
+            cpu_desc = "High-Performance CPU."
+            cpu_reason_en = "Your CPU is powerful, but encoding is memory-intensive. To avoid cache thrashing, [3] is the sweet spot."
+            cpu_reason_cn = "您的 CPU 性能强劲，但视频编码非常依赖内存带宽。为避免资源争抢导致掉速，[3] 是最佳甜点值。"
+        elif cpu_count >= 8:
+            # 8-12 线程 (i5/R5)：标准配置
+            rec_cpu = 2
+            cpu_desc = "Standard 8+ Thread CPU."
+            cpu_reason_en = "Use [2] tasks to balance speed and system responsiveness."
+            cpu_reason_cn = "建议使用 [2] 个并发，以在速度和系统响应之间取得平衡。"
+        else:
+            # 低于 8 线程
+            rec_cpu = 1
+            cpu_desc = "Basic CPU."
+            cpu_reason_en = "Focus all power on [1] task for best stability."
+            cpu_reason_cn = "集中所有算力处理 [1] 个任务以确保稳定。"
+
+        cpu_msg_en = f"{cpu_desc} ({cpu_count} Threads detected).\nRecommendation: Set to [{rec_cpu}].\n{cpu_reason_en}"
+        cpu_msg_cn = f"{cpu_desc} (检测到 {cpu_count} 线程)。\n推荐：将并发数设置为 [{rec_cpu}]。\n{cpu_reason_cn}"
+
+        # --- 2. GPU 智能建议 (保持工业级检测不变) ---
+        gpu_name = "Unknown"
+        is_dual_nvenc = False
+        
+        try:
+            cmd = ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
+            si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            gpu_name = subprocess.check_output(cmd, startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW, encoding="utf-8").strip()
+        except: pass
+        
+        name_upper = gpu_name.upper()
+        dual_nvenc_triggers = ["RTX 4090", "RTX 4080", "RTX 4070 TI", "RTX 6000", "RTX A6000", "TITAN", "L40", "L4", "A40", "A100", "A800"]
+        
+        for trigger in dual_nvenc_triggers:
+            if trigger in name_upper:
+                is_dual_nvenc = True; break
+        
+        if is_dual_nvenc:
+            rec_gpu = 4
+            gpu_msg_en = f"Detected Dual-NVENC Card ({gpu_name}).\nRecommendation: Set to [3] or [4] to utilize both chips."
+            gpu_msg_cn = f"检测到双编码芯片显卡 ({gpu_name})。\n推荐：将并发数设置为 [3] 或 [4] 以利用双芯片优势。"
+        else:
+            rec_gpu = 2
+            gpu_msg_en = f"Standard Single-NVENC Card ({gpu_name}).\nRecommendation: Set to [2] for max efficiency."
+            gpu_msg_cn = f"标准单编码芯片显卡 ({gpu_name})。\n推荐：将并发数设置为 [2] (效率最高)。"
+
+        if "4070 SUPER" in name_upper:
+            gpu_msg_cn += "\n(注: 4070 Super 为单芯片，与 Ti 不同)"
+
+        return {"en": cpu_msg_en, "cn": cpu_msg_cn}, {"en": gpu_msg_en, "cn": gpu_msg_cn}
 
     # --- 辅助方法：添加分隔线 ---
     def add_separator(self):
@@ -1211,6 +1302,60 @@ class UltraEncoderApp(DnDWindow):
             # 如果正在跑，点击就是停止
             self.stop()
 
+    # [NEW] 启动时自动侦测最佳并发数
+    def detect_optimal_concurrency(self):
+        import subprocess
+        import os
+        
+        # 默认保守值
+        optimal_n = 2
+        
+        try:
+            # 1. 检测显卡 (GPU)
+            # 逻辑：如果是双编码器高端卡 (4080/4090/Ti/Pro)，有能力跑 4 路，但为了稳健默认设为 3
+            gpu_name = "Unknown"
+            is_dual_nvenc = False
+            
+            try:
+                cmd = ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
+                si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                gpu_name = subprocess.check_output(cmd, startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW, encoding="utf-8").strip().upper()
+                
+                dual_nvenc_triggers = ["RTX 4090", "RTX 4080", "RTX 4070 TI", "RTX 6000", "RTX A6000", "TITAN", "L40", "L4", "A40", "A100", "A800"]
+                for trigger in dual_nvenc_triggers:
+                    if trigger in gpu_name:
+                        is_dual_nvenc = True; break
+            except: pass
+
+            # 2. 检测处理器 (CPU)
+            # 逻辑：如果是 16 线程以上的高端 U，也具备跑 3 路的能力
+            cpu_count = os.cpu_count() or 4
+            is_high_core_cpu = (cpu_count >= 16)
+
+            # 3. 综合决策
+            if is_dual_nvenc:
+                # 显卡很强 -> 推荐 3 (用户要求：即使推荐4也降级为3，求稳)
+                optimal_n = 3
+                print(f"[Auto-Config] Detected Dual-NVENC GPU ({gpu_name}). Setting concurrency to 3.")
+            elif is_high_core_cpu:
+                # CPU 很强 -> 推荐 3
+                optimal_n = 3
+                print(f"[Auto-Config] Detected High-Core CPU ({cpu_count} threads). Setting concurrency to 3.")
+            elif cpu_count < 8:
+                # 电脑太弱 -> 降级为 1 (保护老电脑)
+                optimal_n = 1
+                print(f"[Auto-Config] Detected Weak CPU. Limiting concurrency to 1.")
+            else:
+                # 普通配置 -> 2
+                optimal_n = 2
+                print(f"[Auto-Config] Standard hardware detected. Defaulting to 2.")
+
+        except Exception as e:
+            print(f"[Auto-Config] Detection failed: {e}. Fallback to 2.")
+            optimal_n = 2
+            
+        return str(optimal_n)
+
     # =========================================================================
     # === [UI V5.0 终极逻辑版] 互斥锁 + 视觉统一 + 420px ===
     # =========================================================================
@@ -1428,6 +1573,13 @@ class UltraEncoderApp(DnDWindow):
         row3 = ctk.CTkFrame(l_btm, fg_color="transparent")
         row3.pack(fill="x", pady=ROW_SPACING, padx=UNIFIED_PAD_X)
         ctk.CTkLabel(row3, text="CONCURRENCY / 并发任务", font=FONT_TITLE_MINI, text_color="#DDD").pack(anchor="w", pady=LABEL_PAD)
+        
+        # [修改] 调用智能检测函数来设置默认值 (原来是 value="2")
+        # 这样程序一启动，按钮就会自动停在最适合这台电脑的位置上
+        default_worker = self.detect_optimal_concurrency()
+        
+        self.worker_var = ctk.StringVar(value=default_worker) # <--- 这里修改了
+        
         self.seg_worker = ctk.CTkSegmentedButton(row3, values=["1", "2", "3", "4"], variable=self.worker_var, 
                                                corner_radius=8, height=30, selected_color=COLOR_ACCENT, 
                                                command=self.update_monitor_layout,
@@ -2323,6 +2475,11 @@ class UltraEncoderApp(DnDWindow):
             start_t = time.time()
             last_ui_update_time = 0 
             
+            # [Fix] 动态调整 UI 刷新率
+            # 10-bit 压制时，系统负载极大，强制降低 UI 刷新频率以防止界面卡死
+            # 8-bit: 0.2s 刷新一次 (流畅) | 10-bit: 0.8s 刷新一次 (稳定)
+            ui_update_interval = 0.8 if use_10bit else 0.25
+
             for line in proc.stdout:
                 if self.stop_flag: break
                 try: 
@@ -2333,7 +2490,8 @@ class UltraEncoderApp(DnDWindow):
                         progress_stats[key.strip()] = value.strip()
                         if key.strip() == "out_time_us":
                             now = time.time()
-                            if now - last_ui_update_time > 0.2:
+                            # [Fix] 使用动态间隔
+                            if now - last_ui_update_time > ui_update_interval:
                                 fps = float(progress_stats.get("fps", "0")) if "fps" in progress_stats else 0.0
                                 current_us = int(value.strip())
                                 prog = min(1.0, (current_us / 1000000.0) / duration)
