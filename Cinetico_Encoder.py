@@ -575,7 +575,6 @@ class HelpWindow(ctk.CTkToplevel):
         super().__init__(*args, **kwargs)
         self.geometry("1150x900") 
         self.title("Cinético - Technical Guide")
-        self.attributes("-topmost", True)
         self.lift()
         self.focus_force()
         
@@ -648,24 +647,26 @@ class HelpWindow(ctk.CTkToplevel):
             "新一代开源编码格式，具备更优异的压缩效率。适用于对体积控制有极高要求的场景，编码耗时长，播放端需硬件支持。"
         )
 
-        # 3. Image Quality (修改为统一卡片风格)
-        self.add_sub_header("3. Image Quality Quantization / 画质量化")
-        self.add_desc_text("Uses CRF for image quality control. / 以 CRF 进行画质控制。")
+        # [修改] 3. Image Quality Quantization / 画质量化
+        # 文案风格：技术性、简洁、无修辞
+        self.add_sub_header("3. Rate Control & Quality / 码率控制与画质")
+        self.add_desc_text("The quantization strategy adapts automatically based on the hardware selection.\n量化策略根据硬件选择自动适配。")
         
         self.add_item_block(
-            "18 - 19", "Visually Lossless / 视觉无损",
-            "Visually Lossless. Retains complete image detail; suitable for raw footage backup.",
-            "视觉无损。保留完整的画面细节，适用于原始素材备份。"
+            "CPU Mode: CRF (Constant Rate Factor)", "基准值: 23",
+            "Based on psychovisual models. Allocates bitrate dynamically according to motion complexity. Lower values yield higher quality.\nDefault: 23 (Balanced).",
+            "基于心理视觉模型的恒定速率因子。根据画面运动复杂度动态分配码率，压缩效率极高。数值越小画质越高。\n默认值：23（平衡点）。"
         )
         self.add_item_block(
-            "20 - 24", "Balanced Preset / 平衡预设",
-            "Balanced Preset. Strikes a balance between visual fidelity and file size; suitable for mainstream streaming platforms.",
-            "平衡预设。在视觉保真度与文件体积之间取得平衡，适用于主流流媒体平台。"
+            "GPU Mode: CQ (Constant Quantization)", "基准值: 28",
+            "Based on fixed mathematical quantization. Requires higher values to achieve file sizes comparable to CRF. Linear degradation.\nDefault: 28 (Equivalent to CRF 23).",
+            "基于固定数学算法的量化参数。由于缺乏深度运动预测，需设定比 CRF 更高的数值以控制体积。线性衰减。\n默认值：28（体积近似 CRF 23）。"
         )
+        
         self.add_item_block(
-            "25 - 30", "High Compression / 高压缩率",
-            "High Compression Rate. Good visual quality on mobile screens; significantly reduces storage usage.",
-            "高压缩率。在移动设备屏幕上观感良好，显著降低存储占用。"
+            "Value Guide / 数值参考", "",
+            "CPU (CRF): 18-22 (High) | 23-26 (Balanced) | 27+ (Small)\nGPU (CQ):  20-25 (High) | 26-30 (Balanced) | 31+ (Small)",
+            "CPU (CRF): 18-22 (高画质) | 23-26 (平衡) | 27+ (小体积)\nGPU (CQ):  20-25 (高画质) | 26-30 (平衡) | 31+ (小体积)"
         )
 
         # 4. System Scheduling
@@ -1186,25 +1187,74 @@ class UltraEncoderApp(DnDWindow):
         l_btm.pack(side="bottom", fill="x", padx=UNIFIED_PAD_X, pady=10)
 
         # 变量初始化
-        self.gpu_var = ctk.BooleanVar(value=True)
+        # [修改] GPU 默认关闭 (追求极致画质/体积)
+        self.gpu_var = ctk.BooleanVar(value=False) 
         self.keep_meta_var = ctk.BooleanVar(value=True)
-        self.hybrid_var = ctk.BooleanVar(value=True)
+        self.hybrid_var = ctk.BooleanVar(value=False) # 分流默认也关掉
         
-        # [修改] 修复默认值不显示的问题。
-        # 这里的字符串必须和下面 segment values 里的完全一致，差一个空格都不行
+        # 优先级与并发
         self.priority_var = ctk.StringVar(value="HIGH / 高优先") 
-        
         self.worker_var = ctk.StringVar(value="2")
+        
+        # [修改] 因为默认是 CPU 模式，所以 CRF 默认回滚到 23
         self.crf_var = ctk.IntVar(value=23)
         self.codec_var = ctk.StringVar(value="H.264")
 
         # === 功能开关组 (Toggle Buttons) ===
-        def toggle_btn_cmd(var, btn):
-            current = var.get()
-            var.set(not current)
-            new_state = var.get()
-            btn.configure(fg_color=COLOR_ACCENT if new_state else "#333333", 
-                          text_color="#FFF" if new_state else "#888")
+        # [逻辑修正] GPU 联动控制函数 (包含对 HYBRID 的互斥锁)
+        # [逻辑修正] GPU 联动控制函数 (包含数值自动换算)
+        def toggle_gpu_cmd():
+            # 1. 切换 GPU 自身状态
+            current_gpu = self.gpu_var.get()
+            new_gpu_state = not current_gpu
+            self.gpu_var.set(new_gpu_state)
+            
+            # 2. 更新 GPU 按钮外观
+            self.btn_gpu.configure(fg_color=COLOR_ACCENT if new_gpu_state else "#333333", 
+                                   text_color="#FFF" if new_gpu_state else "#888")
+            
+            # 3. 联动控制 HYBRID 按钮 (互斥逻辑)
+            if new_gpu_state:
+                # 开启 GPU -> 解锁 HYBRID
+                self.btn_hybrid.configure(state="normal", fg_color="#333333", text_color="#888")
+            else:
+                # 关闭 GPU -> 锁定并关闭 HYBRID
+                self.hybrid_var.set(False)
+                self.btn_hybrid.configure(state="disabled", fg_color="#222222", text_color="#555")
+            
+            # 4. [核心升级] 动态画质换算 (CRF <=> CQ)
+            # 经验公式：NVENC CQ 通常需要比 x264 CRF 高 5 个点，才能获得相似的体积/画质平衡
+            OFFSET = 5 
+            current_val = self.crf_var.get()
+            
+            if new_gpu_state:
+                # === 切到 GPU 模式 (数值变大) ===
+                self.lbl_quality_title.configure(text="QUALITY (CQ) / 固定量化")
+                
+                # 自动计算新值：当前值 + 5
+                new_val = current_val + OFFSET
+                
+                # 边界检查：不要超过滑块最大值 40
+                if new_val > 40: new_val = 40
+                
+                self.crf_var.set(new_val)
+                
+            else:
+                # === 切回 CPU 模式 (数值变小) ===
+                self.lbl_quality_title.configure(text="QUALITY (CRF) / 恒定速率")
+                
+                # 自动计算新值：当前值 - 5
+                new_val = current_val - OFFSET
+                
+                # 边界检查：不要低于滑块最小值 16
+                if new_val < 16: new_val = 16
+                
+                self.crf_var.set(new_val)
+
+        # 辅助函数：通用开关
+        def toggle_common_cmd(var, btn):
+            var.set(not var.get())
+            btn.configure(fg_color=COLOR_ACCENT if var.get() else "#333", text_color="#FFF" if var.get() else "#888")
 
         f_toggles = ctk.CTkFrame(l_btm, fg_color="transparent")
         f_toggles.pack(fill="x", padx=UNIFIED_PAD_X, pady=(15, 5))
@@ -1212,63 +1262,66 @@ class UltraEncoderApp(DnDWindow):
         f_toggles.grid_columnconfigure(1, weight=1)
         f_toggles.grid_columnconfigure(2, weight=1)
         
-        # [尺寸恢复] 高度恢复到 48
+        # [修改] 按钮创建与初始化逻辑
+        
+        # 1. GPU 按钮 (默认状态由 self.gpu_var 决定，现在是 False/灰色)
         self.btn_gpu = ctk.CTkButton(f_toggles, text="GPU ACCEL\n硬件加速", font=FONT_BTN_BIG,
-                                     corner_radius=8, height=48, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER)
-        self.btn_gpu.configure(command=lambda: toggle_btn_cmd(self.gpu_var, self.btn_gpu))
+                                     corner_radius=8, height=48, 
+                                     fg_color="#333333", text_color="#888", hover_color=COLOR_ACCENT_HOVER)
+        self.btn_gpu.configure(command=toggle_gpu_cmd)
         self.btn_gpu.grid(row=0, column=0, padx=(0, 3), sticky="ew")
 
+        # 2. Meta 按钮 (默认开启)
         self.btn_meta = ctk.CTkButton(f_toggles, text="KEEP DATA\n保留信息", font=FONT_BTN_BIG,
                                       corner_radius=8, height=48, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER)
-        self.btn_meta.configure(command=lambda: toggle_btn_cmd(self.keep_meta_var, self.btn_meta))
+        self.btn_meta.configure(command=lambda: toggle_common_cmd(self.keep_meta_var, self.btn_meta))
         self.btn_meta.grid(row=0, column=1, padx=3, sticky="ew")
 
+        # 3. Hybrid 按钮 (默认关闭且禁用，因为 GPU 默认是关的)
         self.btn_hybrid = ctk.CTkButton(f_toggles, text="HYBRID\n异构分流", font=FONT_BTN_BIG,
-                                        corner_radius=8, height=48, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER)
-        self.btn_hybrid.configure(command=lambda: toggle_btn_cmd(self.hybrid_var, self.btn_hybrid))
+                                        corner_radius=8, height=48, 
+                                        fg_color="#222222", text_color="#555", # 初始外观为禁用态
+                                        state="disabled",                      # 初始状态为禁用
+                                        hover_color=COLOR_ACCENT_HOVER)
+        self.btn_hybrid.configure(command=lambda: toggle_common_cmd(self.hybrid_var, self.btn_hybrid))
         self.btn_hybrid.grid(row=0, column=2, padx=(3, 0), sticky="ew")
 
-        # --- 系统优先级 ---
+        # --- 系统优先级 (保持不变) ---
         rowP = ctk.CTkFrame(l_btm, fg_color="transparent")
         rowP.pack(fill="x", pady=ROW_SPACING, padx=UNIFIED_PAD_X)
         ctk.CTkLabel(rowP, text="PRIORITY / 系统优先级", font=FONT_TITLE_MINI, text_color="#DDD").pack(anchor="w", pady=LABEL_PAD)
-        
         self.seg_priority = ctk.CTkSegmentedButton(rowP, values=["NORMAL / 常规", "ABOVE / 较高", "HIGH / 高优先"], 
                                                   variable=self.priority_var, 
                                                   command=lambda v: self.apply_system_priority(v),
-                                                  selected_color=COLOR_ACCENT, # 确保颜色一致
-                                                  corner_radius=8, height=30)
+                                                  selected_color=COLOR_ACCENT, corner_radius=8, height=30)
         self.seg_priority.pack(fill="x")
 
-        # --- 并发任务 ---
+        # --- 并发任务 (保持不变) ---
         row3 = ctk.CTkFrame(l_btm, fg_color="transparent")
         row3.pack(fill="x", pady=ROW_SPACING, padx=UNIFIED_PAD_X)
         ctk.CTkLabel(row3, text="CONCURRENCY / 并发任务", font=FONT_TITLE_MINI, text_color="#DDD").pack(anchor="w", pady=LABEL_PAD)
-        
-        # [修改] 增加了 selected_color=COLOR_ACCENT，让选中时的蓝色跟其他按钮统一
         self.seg_worker = ctk.CTkSegmentedButton(row3, values=["1", "2", "3", "4"], variable=self.worker_var, 
-                                               corner_radius=8, height=30,
-                                               selected_color=COLOR_ACCENT, 
-                                               selected_hover_color=COLOR_ACCENT_HOVER,
+                                               corner_radius=8, height=30, selected_color=COLOR_ACCENT, 
                                                command=self.update_monitor_layout)
         self.seg_worker.pack(fill="x")
 
-        # --- 画质滑块 (核心修复：左对齐) ---
+        # --- 画质滑块 (逻辑微调) ---
         row2 = ctk.CTkFrame(l_btm, fg_color="transparent")
         row2.pack(fill="x", pady=ROW_SPACING, padx=UNIFIED_PAD_X)
-        ctk.CTkLabel(row2, text="QUALITY (CRF) / 画质控制", font=FONT_TITLE_MINI, text_color="#DDD").pack(anchor="w", pady=LABEL_PAD)
+        
+        # [修改] 初始状态是 CPU，所以显示 CRF
+        self.lbl_quality_title = ctk.CTkLabel(row2, text="QUALITY (CRF) / 恒定速率", font=FONT_TITLE_MINI, text_color="#DDD")
+        self.lbl_quality_title.pack(anchor="w", pady=LABEL_PAD)
         
         c_box = ctk.CTkFrame(row2, fg_color="transparent")
-        c_box.pack(fill="x") # 默认 fill=x
+        c_box.pack(fill="x")
         
-        # [修正] Slider 默认左右有内边距，我们手动设置 border_width=0 且 padx=0
-        # 高度恢复到 20，稍微大一点方便拖动
-        slider = ctk.CTkSlider(c_box, from_=16, to=35, variable=self.crf_var, progress_color=COLOR_ACCENT, height=20)
-        # 这里用 pack 且 fill="x" 让它撑满，但可以通过 padx=(0, 10) 来微调右侧留空给数字
+        # [修改] 滑块范围调整：为了适配 CQ 的高数值，建议把最大值从 35 放到 40
+        slider = ctk.CTkSlider(c_box, from_=16, to=40, variable=self.crf_var, progress_color=COLOR_ACCENT, height=20)
         slider.pack(side="left", fill="x", expand=True, padx=(0, 5))
         
         ctk.CTkLabel(c_box, textvariable=self.crf_var, width=35, font=("Arial", 12, "bold"), text_color=COLOR_ACCENT).pack(side="right")
-        
+
         # --- 编码格式 ---
         row1 = ctk.CTkFrame(l_btm, fg_color="transparent")
         row1.pack(fill="x", pady=ROW_SPACING, padx=UNIFIED_PAD_X)
@@ -1600,7 +1653,9 @@ class UltraEncoderApp(DnDWindow):
         top.geometry(f"{w}x{h}+{x}+{y}")
         
         top.overrideredirect(True)
-        top.attributes("-topmost", True)
+        # [新增] 让特效窗口“依附”于主窗口
+        # 这样它会永远盖在主程序上面，但不会盖在其他软件（如浏览器）上面
+        top.transient(self)
         top.attributes("-transparentcolor", "black") 
         
         canvas = ctk.CTkCanvas(top, bg="black", highlightthickness=0)
@@ -2165,6 +2220,15 @@ class UltraEncoderApp(DnDWindow):
             if self.stop_flag:
                 self.safe_update(card.set_status, "已停止", COLOR_PAUSED, STATE_PENDING)
             elif proc.returncode == 0:
+                # 如果用户开启了“保留信息”，强制同步文件的修改时间
+                if self.keep_meta_var.get() and os.path.exists(working_output_file):
+                    try:
+                        # shutil.copystat 会复制文件的：最后访问时间、最后修改时间、权限位、标志位
+                        # 这样视频在文件夹里看起来就是原汁原味的“旧视频”了
+                        shutil.copystat(task_file, working_output_file)
+                    except Exception as e:
+                        print(f"Meta Copy Error: {e}")
+
                 self.safe_update(card.set_status, "完成", COLOR_SUCCESS, STATE_DONE)
                 self.safe_update(card.set_progress, 1.0, COLOR_SUCCESS)
             else:
