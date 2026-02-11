@@ -932,6 +932,15 @@ class UltraEncoderApp(DnDWindow):
             # 调用 clear_all，它内部会调用 reset_ui_state 把按钮变回“压制”并解锁
             self.clear_all()
 
+    # [新增] 检查是否显示占位符
+    def check_placeholder(self):
+        # 如果队列为空，显示占位符
+        if not self.file_queue:
+            self.lbl_placeholder.pack(expand=True, fill="both", pady=150)
+        # 如果有文件，隐藏占位符
+        else:
+            self.lbl_placeholder.pack_forget()
+
     # 添加文件到列表的逻辑
     def add_list(self, files):
         with self.queue_lock: # 加锁，防止冲突
@@ -967,6 +976,9 @@ class UltraEncoderApp(DnDWindow):
             
             if self.running:
                 self.update_run_status()
+            
+            # [新增] 检查占位符状态 (有文件了就隐藏它)
+            self.safe_update(self.check_placeholder)
 
     # 更新“压制中 (1/10)” 这种文字
     def update_run_status(self):
@@ -1342,6 +1354,17 @@ class UltraEncoderApp(DnDWindow):
         self.scroll = ctk.CTkScrollableFrame(left, fg_color="transparent")
         self.scroll.pack(fill="both", expand=True, padx=10, pady=5)
 
+        # [新增] 列表空状态占位符
+        self.lbl_placeholder = ctk.CTkLabel(
+            self.scroll, 
+            text="📂\n\nDrag & Drop Video Files Here\n拖入视频文件开启任务",
+            font=("微软雅黑", 16, "bold"),
+            text_color="#444444",
+            justify="center" # 文字居中
+        )
+        # 默认让它显示出来 (因为刚启动肯定没文件)
+        self.lbl_placeholder.pack(expand=True, fill="both", pady=150)
+
         # --- 右侧面板 ---
         right = ctk.CTkFrame(self, fg_color=COLOR_PANEL_RIGHT, corner_radius=0)
         right.grid(row=0, column=1, sticky="nsew")
@@ -1368,6 +1391,10 @@ class UltraEncoderApp(DnDWindow):
         for k, v in self.task_widgets.items(): v.destroy()
         self.task_widgets.clear()
         self.file_queue.clear()
+        
+        # [新增] 列表清空了，把占位符显示回来
+        self.check_placeholder()
+        
         self.finished_tasks_count = 0
         
         # 2. [新增] 强制滚动条回到最顶部 (0.0)
