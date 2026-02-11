@@ -8,98 +8,110 @@
 ![AI](https://img.shields.io/badge/Co--Pilot-Gemini-8E75B2?style=flat-square)
 ![Downloads](https://img.shields.io/github/downloads/shaiyueliang9klh/Cinetico_Encoder/total?style=flat-square&color=orange)
 
-**Queue-based Video Encoding Tool with GPU Acceleration / 支持GPU加速的队列化视频压制工具**
+
+<div align="left">
+
+**A queue-based video encoding automation tool with intelligent resource scheduling.**  
+**基于队列的自动化视频转码工具，具备智能资源调度能力。**
 
 </div>
 
 ---
 
-## 📖 Introduction / 简介
+## 📖 Overview / 概述
 
-A queue-based video encoding tool **supporting GPU acceleration**. Powered by the FFmpeg kernel, it optimizes system stability and resource management strategies tailored to the host device's performance.
+Cinético Encoder is a batch video processing tool built on the FFmpeg kernel. It is designed to solve the stability issues often encountered in multi-tasking environments.
 
-队列化视频压制工具，**支持GPU加速**。以 **FFmpeg** 为内核，针对运行设备的性能差异，优化系统稳定性与资源管理策略。
+Unlike simple GUI wrappers, Cinético implements a logic layer that manages memory, VRAM, and I/O priority. It automatically adjusts encoding parameters based on the hardware status to balance processing speed and output quality.
 
----
+Cinético Encoder 是一个基于 FFmpeg 内核的批量视频处理工具，旨在解决多任务环境下的稳定性问题。
 
-## ⚡ Key Optimizations / 主要优化点
-
-### - Optimized I/O Handling / I/O 读写
-- **Local Loopback Mechanism**: Reduces mechanical disk latency by establishing a local loopback link, mapping video data directly to memory buffers for faster encoder feeding.
-- **本地环回机制**：通过建立本地环回链路，将视频数据映射至内存缓冲，减少机械硬盘的 I/O 延迟，提高编码器吞吐效率。
-
-### - Tiered Buffering Strategy / 分层缓存
-- **Smart Pre-read**: Automatically detects system resources to determine pre-read strategies, utilizing RAM or SSD as cache to balance speed with disk lifespan.
-- **智能预读**：自动检测系统资源以判定预读策略，使用 RAM 或 SSD 作为缓存，平衡速度与SSD寿命。
-
-### - System Stability / 系统稳定性
-- **Power Management**: Invokes Windows APIs to prevent the system from sleeping during active encoding tasks.
-- **Thread Priority**: Optimizes thread locking mechanisms to prevent UI freezing during high-load CPU operations.
-- **功耗管理**：调用 Windows 底层 API 防止系统在压制任务进行时自动休眠。
-- **防卡顿优化**：通过优化线程锁机制，防止高负载压制时导致软件界面假死。
-
-### - VRAM Monitoring / 显存监控
-- **OOM Prevention**: Real-time monitoring of GPU video memory. The queue is automatically suspended if VRAM is critically low, preventing crashes.
-- **防崩溃机制**：实时监控 GPU 显存状态。当显存不足时自动挂起任务队列，防止因显存溢出导致程序崩溃。
+不同于简单的图形界面套壳，Cinético 引入了一个逻辑层来管理内存、显存和 I/O 优先级。根据硬件状态自动调整编码参数，平衡处理速度与输出质量。
 
 ---
 
-## 🎞️ Supported Codecs / 支持编码格式
-**H.264 / H.265 / AV1**
+## ⚙️ Core Logic / 核心逻辑
+
+### 1. Smart Rate Control / 智能码率控制
+
+The program distinguishes between the evaluation standards of CPU and GPU encoders.
+程序能够区分 CPU 和 GPU 编码器的评价标准。
+
+* **CPU Mode**: Uses `CRF` (Constant Rate Factor) by default for optimal file size.
+* **CPU 模式**：默认使用 `CRF` (恒定速率因子) 以获得最佳体积控制。
+   
+* **GPU Mode**: Uses `CQ` (Constant Quantization) with an automatic offset. When switching to GPU acceleration, the tool automatically calculates the equivalent value to maintain consistent visual quality and size.
+* **GPU 模式**：使用 `CQ` (固定量化) 并配合自动偏移。切换至 GPU 加速时，工具会自动计算等效数值，以维持一致的视觉质量与文件体积。
+
+### 2. Zero-Copy I/O / 零拷贝 I/O
+
+To reduce mechanical disk latency, the tool maps video streams directly to a Global RAM Singleton. The encoder reads data via a local loopback interface at memory bus speeds, bypassing the file system bottleneck.   
+为了减少机械硬盘延迟，工具将视频流直接映射至全局内存单例。编码器通过本地环回接口以内存总线速度读取数据，绕过文件系统瓶颈。
+
+### 3. Safety Fallback / 安全降级
+
+The engine automatically detects the specifications of the input video. If a file format is not supported by the hardware (e.g., 10-bit 4:2:2 on consumer GPUs), it automatically falls back to CPU decoding to prevent the process from crashing.   
+引擎会自动检测输入视频的规格。如果文件格式不被硬件支持 (例如消费级显卡上的 10-bit 4:2:2)，它会自动降级至 CPU 解码，防止进程崩溃。
+
+### 4. VRAM Guard / 显存保护
+
+Real-time monitoring of GPU memory usage. If VRAM usage approaches the safety threshold during multi-tasking, the queue is temporarily suspended until resources are released.  
+实时监控 GPU 显存使用情况。在多任务处理中，如果显存接近安全阈值，队列将暂时挂起，直到资源被释放。
+
+---
+
+## 🎞️ Supported Formats / 支持格式
+
+ **H.264 (AVC)**  
+ Maximum compatibility. Default for general distribution. <br>
+ 兼容性最好，通用分发的默认选择。
+ 
+ **H.265 (HEVC)**  
+ High compression efficiency. Suitable for 4K/HDR archiving. <br>
+ 高压缩效率，适合 4K/HDR 归档。
+ 
+ **AV1**  
+ Next-gen open standard. Best size-to-quality ratio, requires hardware support. <br>
+ 下一代开放标准，拥有最佳的体积画质比，需要硬件支持。
+
+---
+
+## 🛠️ Usage / 使用说明
+
+### Prerequisites / 环境要求
+
+* **System**: Windows 10 / 11 (64-bit)
+* **Runtime**: [Python 3.10](https://www.python.org/downloads/) or newer.
+* **Core**: [FFmpeg](https://ffmpeg.org/download.html) (Must be added to the system `PATH`).
+* *Note: The script will check for FFmpeg upon startup.*
+* *注：脚本启动时会自动检查 FFmpeg。*
+
+
+
+### Running the Tool / 运行工具
+
+1. **Clone or Download**
+下载源码或克隆仓库：
+```bash
+git clone https://github.com/shaiyueliang9klh/Cinetico_Encoder.git
+cd Cinetico_Encoder
+
+```
+
+
+2. Ensure you have a [**Python 3.10+** environment](https://www.python.org/downloads/).
+   确保已[安装 **Python 3.10+** 环境](https://www.python.org/downloads/)。
+
+3. Run the script or just double click to run / 运行脚本或直接双击运行
 
 
 ---
 
+## 📄 License / 许可证
+
+This project is open-source under the **MIT License**.
+本项目基于 **MIT License** 开源。
  
-## 🛠️ Quick Start / 快速开始
-
-### Prerequisites / 前置要求
-- Windows 10 / 11
-- Python 3.10 or higher
-- FFmpeg (The script will guide you if it's missing)
-
-### Installation / 安装与运行
-
-1. **Clone the repository**
-   ```bash
-   git clone [https://github.com/shaiyueliang9klh/Cinetico_Encoder.git](https://github.com/shaiyueliang9klh/Cinetico_Encoder.git)
-   cd Cinetico_Encoder
-2. **Run the script**
-   ```bash
-   python ultra_encoder.py
- 
-
----
-
- 
-## 📂 Project Structure / 项目结构
-   ```Plaintext
-      Cinetico_Encoder/
-      ├── ultra_encoder.py    # Main Application Logic (主程序)
-      ├── .gitignore          # Git Configuration
-      ├── LICENSE.txt         # MIT License
-      └── README.md           # Documentation
-   ```
- 
-
----
-
- 
-## 🙏 Acknowledgements / 致谢
-
-This project was developed with the assistance of **Google Gemini**, which provided support in code optimization and documentation.
-
-本项目在开发过程中得到了 **Google Gemini** 的协助，特别是在代码优化与文档构建方面。
- 
-
----
-
- 
-## 📜 License / 许可证
-
-This project is licensed under the MIT License.
-
-本项目采用 MIT License 开源协议，您可以自由地使用、修改和分发。
 
 <div align="center">
     Created with ❤️ by shaiyueliang9klh
