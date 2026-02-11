@@ -379,56 +379,61 @@ def start_global_server():
 # === UI 组件定义 (这里定义界面上的小方块长什么样) ===
 # =========================================================================
 
-# 自定义控件：波形图 (InfinityScope)
+# 自定义控件：波形图 (InfinityScope) - [V2.0 强制刷新版]
 class InfinityScope(ctk.CTkCanvas):
     def __init__(self, master, **kwargs):
         super().__init__(master, bg=COLOR_PANEL_RIGHT, highlightthickness=0, **kwargs)
         self.points = []
         self.display_max = 10.0  
         self.target_max = 10.0   
-        self.needs_redraw = False # 增加标记位，只有数据更新了才画
         self.running = True
-        self.bind("<Configure>", lambda e: self.force_draw()) 
+        self.bind("<Configure>", lambda e: self.draw()) 
         self.animate_loop()
 
     def add_point(self, val):
         self.points.append(val)
+        # 保持数据池不要太大，100个点足够铺满屏幕了
         if len(self.points) > 100: self.points.pop(0)
+        
         current_data_max = max(self.points) if self.points else 10
+        # 动态调整Y轴刻度，让波形图看起来会有“呼吸感”
         self.target_max = max(current_data_max, 10) * 1.2
-        self.needs_redraw = True # 标记：有新数据了，需要画
 
-    def force_draw(self):
-        self.needs_redraw = True
+    def clear(self):
+        self.points = []
         self.draw()
 
     def animate_loop(self):
         if self.winfo_exists() and self.running:
-            # 平滑缩放动画
+            # 1. 每一帧都平滑缩放 Y 轴
             diff = self.target_max - self.display_max
             if abs(diff) > 0.01:
                 self.display_max += diff * 0.1
-                self.needs_redraw = True 
+            
+            # 2. [核心修改] 每一帧都强制重绘，不再等待数据
+            # 这样即使数据没更新，Y轴的缩放动画也能继续，不会卡住
+            self.draw()
 
-            if self.needs_redraw:
-                self.draw()
-                self.needs_redraw = False # 画完重置
-
-            self.after(33, self.animate_loop) # 约 30 帧/秒
+            self.after(33, self.animate_loop) # 30 FPS 刷新率
 
     def draw(self):
         self.delete("all")
         w = self.winfo_width()
         h = self.winfo_height()
-        if w < 10 or h < 10 or not self.points: return
+        if w < 10 or h < 10: return
         
-        scale_y = (h - 20) / self.display_max
+        # 绘制中心虚线
         self.create_line(0, h/2, w, h/2, fill="#2a2a2a", dash=(4, 4))
         
+        if not self.points: return
+
+        scale_y = (h - 20) / self.display_max
         n = len(self.points)
         if n < 2: return
         
-        step_x = w / 99 # 固定宽度步长，不随点数抖动
+        # 自动拉伸 X 轴，让波形永远填满宽度
+        step_x = w / (n - 1) if n > 1 else w
+        
         coords = []
         for i, val in enumerate(self.points):
             x = i * step_x
@@ -436,21 +441,22 @@ class InfinityScope(ctk.CTkCanvas):
             coords.extend([x, y])
             
         if len(coords) >= 4:
-            # 使用绿色渐变视觉效果
+            # 使用平滑曲线
             self.create_line(coords, fill=COLOR_CHART_LINE, width=2, smooth=True)
 
-# 自定义控件：监控通道 (MonitorChannel) - 右边那个跳动的小窗口
+# 自定义控件：监控通道 (MonitorChannel) - [V2.2 智能连续波形版]
 class MonitorChannel(ctk.CTkFrame):
     def __init__(self, master, ch_id, **kwargs):
         super().__init__(master, fg_color="#181818", corner_radius=10, border_width=1, border_color="#333", **kwargs)
-        # ...省略布局代码，这里主要是创建 Label 和 Scope ...
+        
+        # --- 布局部分 (保持不变) ---
         head = ctk.CTkFrame(self, fg_color="transparent", height=25)
         head.pack(fill="x", padx=15, pady=(10,0))
         self.lbl_title = ctk.CTkLabel(head, text=f"通道 {ch_id} · 空闲", font=("微软雅黑", 12, "bold"), text_color="#555")
         self.lbl_title.pack(side="left")
         self.lbl_info = ctk.CTkLabel(head, text="等待任务...", font=("Arial", 11), text_color="#444")
         self.lbl_info.pack(side="right")
-        self.scope = InfinityScope(self) # 嵌入波形图
+        self.scope = InfinityScope(self) 
         self.scope.pack(fill="both", expand=True, padx=2, pady=5)
         btm = ctk.CTkFrame(self, fg_color="transparent")
         btm.pack(fill="x", padx=15, pady=(0,10))
@@ -459,42 +465,84 @@ class MonitorChannel(ctk.CTkFrame):
         ctk.CTkLabel(btm, text="FPS", font=("Arial", 10, "bold"), text_color="#444").pack(side="left", padx=(5,0), pady=(8,0))
         self.lbl_eta = ctk.CTkLabel(btm, text="ETA: --:--", font=("Consolas", 12), text_color="#666")
         self.lbl_eta.pack(side="right", padx=(10, 0))
-        # [新增] 实时压缩率标签
         self.lbl_ratio = ctk.CTkLabel(btm, text="RATIO: --%", font=("Consolas", 12), text_color="#666")
         self.lbl_ratio.pack(side="right", padx=(10, 0))
         self.lbl_prog = ctk.CTkLabel(btm, text="0%", font=("Arial", 14, "bold"), text_color="#333")
         self.lbl_prog.pack(side="right")
+        # -------------------------
 
-    # 激活：当任务开始时调用
+        # [智能起搏器配置]
+        self.is_active = False
+        self.last_update_time = time.time()
+        self.idle_start_time = 0 # 记录何时开始空闲的
+        self.after(500, self._heartbeat) # 启动心跳
+
+    # 智能心跳：负责连接波形，也负责在闲置时休眠
+    def _heartbeat(self):
+        if not self.winfo_exists(): return
+        
+        now = time.time()
+        should_push_zero = False
+        
+        # 情况 A: 正在运行任务 (Active)
+        if self.is_active:
+            # 如果超过 0.8 秒没有收到 FFmpeg 的数据 (可能在提取音频/回写硬盘)
+            if now - self.last_update_time > 0.8:
+                should_push_zero = True
+                
+        # 情况 B: 任务刚结束 (Idle)
+        else:
+            # [关键逻辑] 只有在空闲的前 3 秒内，我们才继续推 0
+            # 作用：让波形平滑回落，并连接到下一个紧接着的任务
+            # 如果超过 3 秒没新任务，就停止刷新，让图表“定格”保留历史记录
+            if now - self.idle_start_time < 3.0:
+                should_push_zero = True
+        
+        if should_push_zero:
+            self.scope.add_point(0)
+            # 只有在确实没有任务跑的时候，才把文字归零
+            if not self.is_active:
+                self.lbl_fps.configure(text="0.00", text_color="#555")
+
+        # 继续循环 (500ms 一次)
+        self.after(500, self._heartbeat)
+
     def activate(self, filename, tag):
         if not self.winfo_exists(): return
+        self.is_active = True
         self.lbl_title.configure(text=f"运行中: {filename[:15]}...", text_color=COLOR_ACCENT)
         self.lbl_info.configure(text=tag, text_color="#AAA")
         self.lbl_fps.configure(text_color="#FFF")
         self.lbl_prog.configure(text_color=COLOR_ACCENT)
         self.lbl_eta.configure(text_color=COLOR_SUCCESS)
-        self.scope.clear()
+        
+        # [关键修改] 删掉了 self.scope.clear()
+        # 这样新任务的波形会接着旧任务画，形成连续的示波器效果
+        
+        self.last_update_time = time.time()
 
-    # 更新数据：每秒调用多次
     def update_data(self, fps, prog, eta, ratio):
         if not self.winfo_exists(): return
+        self.last_update_time = time.time() # 只要有数据，就更新活跃时间
+        
         self.scope.add_point(fps)
-        # [修改] 使用 :.2f 格式化，保留两位小数
-        self.lbl_fps.configure(text=f"{float(fps):.2f}") 
+        self.lbl_fps.configure(text=f"{float(fps):.2f}", text_color="#FFF") 
         self.lbl_prog.configure(text=f"{int(prog*100)}%")
         self.lbl_eta.configure(text=f"ETA: {eta}")
         self.lbl_ratio.configure(text=f"Ratio: {ratio:.1f}%", text_color="#888")
 
-    # 重置：任务结束时调用
     def reset(self):
         if not self.winfo_exists(): return
+        self.is_active = False
+        self.idle_start_time = time.time() # [关键] 记录空闲开始的时间
+        
         self.lbl_title.configure(text="通道 · 空闲", text_color="#555")
         self.lbl_info.configure(text="等待任务...", text_color="#444")
         self.lbl_fps.configure(text="0", text_color="#333")
         self.lbl_prog.configure(text="0%", text_color="#333")
         self.lbl_eta.configure(text="ETA: --:--", text_color="#333")
         self.lbl_ratio.configure(text="Ratio: --%", text_color="#333")
-        self.scope.clear()
+        # 同样不 clear，交给 heartbeat 处理过渡
 
 # 自定义控件：任务卡片 (TaskCard) - [V3.1 对齐修复版]
 class TaskCard(ctk.CTkFrame):
@@ -645,6 +693,22 @@ class HelpWindow(ctk.CTkToplevel):
             "AV1", "",
             "Next-generation open-source coding format with superior compression efficiency. Suitable for scenarios requiring extreme file size control; encoding duration is longer, and playback requires hardware support.",
             "新一代开源编码格式，具备更优异的压缩效率。适用于对体积控制有极高要求的场景，编码耗时长，播放端需硬件支持。"
+        )
+
+        # [新增] 2.5 Color Depth / 色彩深度
+        self.add_separator() # 加条分割线区分一下
+        self.add_sub_header("2.5 Color Depth / 色彩深度")
+        
+        self.add_item_block(
+            "8-BIT", "Standard / 标准色彩",
+            "16.7 million colors. Standard for web streaming and compatibility. \nRecommendation: Use for social media sharing or legacy device playback.",
+            "1670 万色。网络流媒体与兼容性的标准。\n建议：用于社交媒体分享或老旧设备播放。"
+        )
+        
+        self.add_item_block(
+            "10-BIT", "High Color / 高色彩",
+            "1.07 billion colors. Eliminates color banding and improves compression efficiency for gradients. \nRecommendation: Always Enable for Archiving.",
+            "10.7 亿色。彻底消除色彩断层，提升渐变色区域压缩效率。\n建议：存档或追求高画质时务必开启。"
         )
 
         # [修改] 3. Image Quality Quantization / 画质量化
@@ -932,14 +996,23 @@ class UltraEncoderApp(DnDWindow):
             # 调用 clear_all，它内部会调用 reset_ui_state 把按钮变回“压制”并解锁
             self.clear_all()
 
-    # [新增] 检查是否显示占位符
+    # [修改版] 检查是否显示占位符 (互斥切换模式)
     def check_placeholder(self):
-        # 如果队列为空，显示占位符
         if not self.file_queue:
-            self.lbl_placeholder.pack(expand=True, fill="both", pady=150)
-        # 如果有文件，隐藏占位符
+            # === 空状态 ===
+            # 1. 拔掉滚动列表 (腾出空间)
+            self.scroll.pack_forget()
+            
+            # 2. 显示占位符 (因为它现在独占中间区域，expand=True 会让它完美垂直居中)
+            self.lbl_placeholder.pack(fill="both", expand=True, padx=10, pady=5)
+            
         else:
+            # === 有任务 ===
+            # 1. 拔掉占位符
             self.lbl_placeholder.pack_forget()
+            
+            # 2. 恢复滚动列表
+            self.scroll.pack(fill="both", expand=True, padx=10, pady=5)
 
     # 添加文件到列表的逻辑
     def add_list(self, files):
@@ -1142,7 +1215,7 @@ class UltraEncoderApp(DnDWindow):
     # === [UI V4.0 修正版] 恢复按钮尺寸 & 强制左对齐 ===
     # =========================================================================
     def setup_ui(self):
-        SIDEBAR_WIDTH = 400 
+        SIDEBAR_WIDTH = 420 
         
         self.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_WIDTH)
         self.grid_columnconfigure(1, weight=1)
@@ -1203,6 +1276,7 @@ class UltraEncoderApp(DnDWindow):
         self.gpu_var = ctk.BooleanVar(value=False) 
         self.keep_meta_var = ctk.BooleanVar(value=True)
         self.hybrid_var = ctk.BooleanVar(value=False) # 分流默认也关掉
+        self.depth_10bit_var = ctk.BooleanVar(value=False) # [新增] 默认关闭 (8bit)
         
         # 优先级与并发
         self.priority_var = ctk.StringVar(value="HIGH / 高优先") 
@@ -1270,33 +1344,42 @@ class UltraEncoderApp(DnDWindow):
 
         f_toggles = ctk.CTkFrame(l_btm, fg_color="transparent")
         f_toggles.pack(fill="x", padx=UNIFIED_PAD_X, pady=(15, 5))
+        # [修改] 配置 4 列权重
         f_toggles.grid_columnconfigure(0, weight=1)
         f_toggles.grid_columnconfigure(1, weight=1)
         f_toggles.grid_columnconfigure(2, weight=1)
+        f_toggles.grid_columnconfigure(3, weight=1) # [新增] 第4列
         
         # [修改] 按钮创建与初始化逻辑
         
-        # 1. GPU 按钮 (默认状态由 self.gpu_var 决定，现在是 False/灰色)
+        # 1. GPU 按钮
         self.btn_gpu = ctk.CTkButton(f_toggles, text="GPU ACCEL\n硬件加速", font=FONT_BTN_BIG,
                                      corner_radius=8, height=48, 
                                      fg_color="#333333", text_color="#888", hover_color=COLOR_ACCENT_HOVER)
         self.btn_gpu.configure(command=toggle_gpu_cmd)
         self.btn_gpu.grid(row=0, column=0, padx=(0, 3), sticky="ew")
 
-        # 2. Meta 按钮 (默认开启)
+        # 2. Meta 按钮
         self.btn_meta = ctk.CTkButton(f_toggles, text="KEEP DATA\n保留信息", font=FONT_BTN_BIG,
                                       corner_radius=8, height=48, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER)
         self.btn_meta.configure(command=lambda: toggle_common_cmd(self.keep_meta_var, self.btn_meta))
         self.btn_meta.grid(row=0, column=1, padx=3, sticky="ew")
 
-        # 3. Hybrid 按钮 (默认关闭且禁用，因为 GPU 默认是关的)
+        # 3. Hybrid 按钮
         self.btn_hybrid = ctk.CTkButton(f_toggles, text="HYBRID\n异构分流", font=FONT_BTN_BIG,
                                         corner_radius=8, height=48, 
-                                        fg_color="#222222", text_color="#555", # 初始外观为禁用态
-                                        state="disabled",                      # 初始状态为禁用
-                                        hover_color=COLOR_ACCENT_HOVER)
+                                        fg_color="#222222", text_color="#555", 
+                                        state="disabled", hover_color=COLOR_ACCENT_HOVER)
         self.btn_hybrid.configure(command=lambda: toggle_common_cmd(self.hybrid_var, self.btn_hybrid))
-        self.btn_hybrid.grid(row=0, column=2, padx=(3, 0), sticky="ew")
+        self.btn_hybrid.grid(row=0, column=2, padx=3, sticky="ew")
+
+        # 4. [新增] 10-BIT 按钮
+        self.btn_10bit = ctk.CTkButton(f_toggles, text="10-BIT\n高色彩", font=FONT_BTN_BIG,
+                                       corner_radius=8, height=48, 
+                                       fg_color="#333333", text_color="#888", # 默认灰色
+                                       hover_color=COLOR_ACCENT_HOVER)
+        self.btn_10bit.configure(command=lambda: toggle_common_cmd(self.depth_10bit_var, self.btn_10bit))
+        self.btn_10bit.grid(row=0, column=3, padx=(3, 0), sticky="ew")
 
         # --- 系统优先级 (保持不变) ---
         rowP = ctk.CTkFrame(l_btm, fg_color="transparent")
@@ -1351,19 +1434,20 @@ class UltraEncoderApp(DnDWindow):
         self.btn_action.pack(fill="x", padx=UNIFIED_PAD_X, pady=20)
 
         # --- 列表区 ---
+        # 1. 列表容器 (先创建，但不 Pack，交给 check_placeholder 管理)
         self.scroll = ctk.CTkScrollableFrame(left, fg_color="transparent")
-        self.scroll.pack(fill="both", expand=True, padx=10, pady=5)
-
-        # [新增] 列表空状态占位符
+        
+        # 2. [修改] 占位符现在直接挂在 left 面板上，不再塞进 scroll 里
         self.lbl_placeholder = ctk.CTkLabel(
-            self.scroll, 
+            left, # <--- 关键修改：父对象改为 left
             text="📂\n\nDrag & Drop Video Files Here\n拖入视频文件开启任务",
             font=("微软雅黑", 16, "bold"),
             text_color="#444444",
-            justify="center" # 文字居中
+            justify="center"
         )
-        # 默认让它显示出来 (因为刚启动肯定没文件)
-        self.lbl_placeholder.pack(expand=True, fill="both", pady=150)
+
+        # 3. 初始化状态检查 (这一步会自动决定显示哪一个)
+        self.check_placeholder()
 
         # --- 右侧面板 ---
         right = ctk.CTkFrame(self, fg_color=COLOR_PANEL_RIGHT, corner_radius=0)
@@ -2141,14 +2225,49 @@ class UltraEncoderApp(DnDWindow):
                 elif "H.265" in codec_sel: v_codec = "hevc_nvenc"
                 elif "AV1" in codec_sel: v_codec = "av1_nvenc"
                 cmd.extend(["-c:v", v_codec])
-                if final_hw_decode: cmd.extend(["-vf", "scale_cuda=format=yuv420p"]) 
-                else: cmd.extend(["-pix_fmt", "yuv420p"]) 
+            
+            # === [核心修改] 手动位深控制 ===
+            # 1. 获取用户开关状态
+            use_10bit = self.depth_10bit_var.get()
+            
+            # [安全门] 如果是 GPU 加速且选了 H.264，强制回退到 8-bit
+            # 因为消费级显卡 (GeForce) 的 NVENC 不支持 H.264 10-bit
+            if final_hw_encode and "H.264" in codec_sel and use_10bit:
+                print("Warning: NVENC H.264 does not support 10-bit on this device. Fallback to 8-bit.")
+                use_10bit = False
+
+            # 2. 应用像素格式参数
+            if final_hw_encode:
+                # === GPU 编码 (NVENC) ===
+                if use_10bit:
+                    # 10-bit (P010)
+                    if final_hw_decode: 
+                        # 显存内转换: yuv420p -> p010le
+                        cmd.extend(["-vf", "scale_cuda=format=p010le"]) 
+                    else: 
+                        # 内存上传: 直接指定 p010le
+                        cmd.extend(["-pix_fmt", "p010le"])
+                else:
+                    # 8-bit (YUV420P)
+                    if final_hw_decode: 
+                        cmd.extend(["-vf", "scale_cuda=format=yuv420p"]) 
+                    else: 
+                        cmd.extend(["-pix_fmt", "yuv420p"]) 
+
+                # 码率控制 (保持不变)
                 cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), "-b:v", "0"])
                 if "AV1" not in codec_sel: cmd.extend(["-preset", "p4"])
+            
             else:
-                if "H.265" in codec_sel: v_codec = "libx265"
-                elif "AV1" in codec_sel: v_codec = "libsvtav1"
-                cmd.extend(["-c:v", v_codec, "-pix_fmt", "yuv420p", "-crf", str(self.crf_var.get()), "-preset", "medium"])
+                # === CPU 编码 (x264/x265/SVT-AV1) ===
+                if use_10bit:
+                    # CPU 10-bit 通常使用 yuv420p10le
+                    cmd.extend(["-pix_fmt", "yuv420p10le"])
+                else:
+                    # 8-bit
+                    cmd.extend(["-pix_fmt", "yuv420p"])
+
+                cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
 
             if has_audio: cmd.extend(["-c:a", "aac", "-b:a", "320k"])
             if self.keep_meta_var.get(): cmd.extend(["-map_metadata", "0"])
