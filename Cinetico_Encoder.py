@@ -545,6 +545,21 @@ class MonitorChannel(ctk.CTkFrame):
         self.lbl_eta.configure(text="ETA: --:--", text_color="#333")
         self.lbl_ratio.configure(text="Ratio: --%", text_color="#333")
 
+    # [新增] 将卡片设置为“未启用”样式的占位符
+    def set_placeholder(self):
+        if not self.winfo_exists(): return
+        self.is_active = False
+        self.configure(border_color="#222") # 边框变暗
+        self.lbl_title.configure(text="通道 · 未启用", text_color="#333")
+        self.lbl_info.configure(text="Channel Disabled", text_color="#2a2a2a")
+        
+        # 隐藏或变暗数据
+        self.scope.clear() # 清空波形
+        self.lbl_fps.configure(text="--", text_color="#222")
+        self.lbl_prog.configure(text="--", text_color="#222")
+        self.lbl_eta.configure(text="", text_color="#222")
+        self.lbl_ratio.configure(text="", text_color="#222")
+
 class ToastNotification(ctk.CTkFrame):
     def __init__(self, master, text, icon="ℹ️"):
         super().__init__(master, fg_color="#1F1F1F", corner_radius=20, border_width=1, border_color="#333")
@@ -1104,29 +1119,59 @@ class UltraEncoderApp(DnDWindow):
             self.btn_10bit.configure(fg_color=COLOR_ACCENT if is_10bit else COL_BTN_BG_OFF, text_color=COL_TEXT_ACTIVE if is_10bit else COL_TEXT_INACTIVE)
         def on_toggle_gpu():
             target = not self.gpu_var.get()
-            if target and "H.264" in self.codec_var.get() and self.depth_10bit_var.get(): self.depth_10bit_var.set(False)
+            bit10_was_on = self.depth_10bit_var.get()
+            auto_10bit_off = False
+
+            # 逻辑对冲：开启 GPU 时，如果当前是 H.264 且 10-bit 开启，则强制关闭 10-bit
+            if target and "H.264" in self.codec_var.get() and bit10_was_on:
+                self.depth_10bit_var.set(False)
+                auto_10bit_off = True
+
             self.gpu_var.set(target)
+            # 联动逻辑：关闭 GPU 则同步关闭异构分流
             if not target: self.hybrid_var.set(False) 
+            
+            # 自动调整 CRF/CQ 基础值（GPU 压制通常需要更高的数值来维持体积）
             if target: self.crf_var.set(min(40, self.crf_var.get() + 5))
             else: self.crf_var.set(max(16, self.crf_var.get() - 5))
+            
             update_btn_visuals()
             update_labels()
-            # [新增]
-            state_text = "开启" if self.gpu_var.get() else "关闭"
-            self.show_toast(f"GPU 加速已{state_text} (将在下一任务生效)", "⚙️")
+
+            # --- 智能提示语 ---
+            state_text = "开启" if target else "关闭"
+            msg = f"GPU 硬件加速已{state_text}"
+            if auto_10bit_off:
+                msg += " (已自动禁用 10-bit 以确保硬件编码兼容性)"
+                self.show_toast(msg, "🚀")
+            else:
+                self.show_toast(msg, "⚙️")
+
         def on_toggle_10bit():
             target = not self.depth_10bit_var.get()
-            if target and "H.264" in self.codec_var.get():
-                if self.gpu_var.get():
-                    self.gpu_var.set(False)
-                    self.hybrid_var.set(False) 
-                    self.crf_var.set(max(16, self.crf_var.get() - 5))
+            gpu_was_on = self.gpu_var.get()
+            auto_gpu_off = False
+
+            # 逻辑对冲：开启 10-bit 时，如果当前是 H.264 且 GPU 开启，则强制关闭 GPU
+            if target and "H.264" in self.codec_var.get() and gpu_was_on:
+                self.gpu_var.set(False)
+                self.hybrid_var.set(False) 
+                self.crf_var.set(max(16, self.crf_var.get() - 5))
+                auto_gpu_off = True
+
             self.depth_10bit_var.set(target)
             update_btn_visuals()
             update_labels()
-            # [新增]
-            state_text = "开启" if self.gpu_var.get() else "关闭"
-            self.show_toast(f"GPU 加速已{state_text} (将在下一任务生效)", "⚙️")
+
+            # --- 智能提示语 ---
+            state_text = "开启" if target else "关闭"
+            msg = f"10-bit 高色深已{state_text}"
+            if auto_gpu_off:
+                msg += " (已自动禁用 GPU 加速以支持高规格编码)"
+                self.show_toast(msg, "🎨")
+            else:
+                self.show_toast(msg, "🎨")
+
         def on_codec_change(value):
             if "H.264" in value:
                 if self.gpu_var.get() and self.depth_10bit_var.get():
@@ -1195,8 +1240,12 @@ class UltraEncoderApp(DnDWindow):
         self.lbl_run_status.pack(side="left", padx=20, pady=2) 
         self.lbl_gpu = ctk.CTkLabel(r_head, text="GPU: --W | --°C", font=("Consolas", 14, "bold"), text_color="#444")
         self.lbl_gpu.pack(side="right")
-        self.monitor_frame = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        # [修改] 使用普通的 Frame，彻底告别滚动条
+        self.monitor_frame = ctk.CTkFrame(right, fg_color="transparent")
         self.monitor_frame.pack(fill="both", expand=True, padx=25, pady=(0, 15))
+        
+        # [注意] 请把之前那两行 bind("<Button-4>"...) 的代码删掉！
+        # 普通 Frame 没有 _parent_canvas 属性，留着会报错。
 
     def clear_all(self):
         if self.running: return 
@@ -1215,17 +1264,99 @@ class UltraEncoderApp(DnDWindow):
         if self.running and not force_reset:
             self.seg_worker.set(str(self.current_workers))
             return
+            
         try: n = int(self.worker_var.get())
         except: n = 2
         self.current_workers = n
+        
+        # 清除旧控件
         for ch in self.monitor_slots: ch.destroy() 
         self.monitor_slots.clear()
+        
+        # [关键修改]：生成卡片逻辑
         with self.slot_lock:
-            self.available_indices = [i for i in range(n)] 
-        for i in range(n):
-            ch = MonitorChannel(self.monitor_frame, i+1) 
-            ch.pack(fill="both", expand=True, pady=5)
-            self.monitor_slots.append(ch)
+            self.available_indices = [i for i in range(n)] # 只有前 n 个是真正的任务槽
+            
+            # 1. 生成真正的 n 个工作卡片
+            for i in range(n):
+                ch = MonitorChannel(self.monitor_frame, i+1)
+                self.monitor_slots.append(ch)
+            
+            # 2. [对称美学] 如果是奇数个且大于1 (比如3)，就多生成一个凑成偶数
+            if n > 1 and n % 2 != 0:
+                dummy = MonitorChannel(self.monitor_frame, n+1)
+                dummy.set_placeholder() # 把它变灰
+                dummy.is_dummy = True   # 打上标记，方便后续管理
+                self.monitor_slots.append(dummy)
+            else:
+                # 偶数个不需要补位
+                pass
+
+        # 绑定调整事件
+        if not hasattr(self, "_resize_bind_id"):
+            self._resize_bind_id = self.monitor_frame.bind("<Configure>", self._trigger_adaptive_layout)
+        
+        # 权重设置
+        self.monitor_frame.grid_columnconfigure(0, weight=1)
+        self.monitor_frame.grid_columnconfigure(1, weight=1)
+
+        # 立即排版
+        self._trigger_adaptive_layout()
+
+    def _trigger_adaptive_layout(self, event=None):
+        # 防抖动设计：延迟 100ms 再计算，防止拖拽窗口时闪烁
+        if hasattr(self, "_layout_timer") and self._layout_timer:
+            self.after_cancel(self._layout_timer)
+        self._layout_timer = self.after(100, self._apply_adaptive_layout)
+
+    def _apply_adaptive_layout(self):
+        if not self.monitor_slots: return
+        
+        viewport_height = self.monitor_frame.winfo_height()
+        
+        # [修正] 启动保护：如果窗口还没渲染出来，强制认为高度足够大(避免误判)，
+        # 或者强制认为高度是默认值。根据你之前的反馈，启动时容易误判为单列。
+        # 我们这里用一个保守值：如果高度离谱地小，就假定它是 750 (默认窗口内容区高度)
+        if viewport_height < 50: viewport_height = 750
+        
+        # 计算有效卡片数量 (去掉幽灵卡片)
+        real_slots = [ch for ch in self.monitor_slots if not getattr(ch, 'is_dummy', False)]
+        real_count = len(real_slots)
+        
+        # [核心阈值]：非常严格！
+        # 只要每张卡分不到 340px 的高度，就立刻切双列。
+        # 3个任务需要 3*340 = 1020px。你的窗口才900px，肯定不够 -> 必定触发双列。
+        needed_height = real_count * 340 
+        
+        # 只有1个任务时，永远单列。大于1个任务才考虑 Grid。
+        use_grid_mode = (viewport_height < needed_height) and (real_count > 1)
+
+        # 开始排列
+        for i, ch in enumerate(self.monitor_slots):
+            ch.pack_forget()
+            ch.grid_forget()
+            
+            # 如果是幽灵卡片，需要特殊处理
+            if getattr(ch, 'is_dummy', False):
+                if use_grid_mode:
+                    # Grid 模式：显示幽灵卡片，凑齐 2x2 或 3x2
+                    row = i // 2
+                    col = i % 2
+                    ch.grid(row=row, column=col, sticky="ew", padx=5, pady=5)
+                else:
+                    # 单列模式：隐藏幽灵卡片 (直接竖排 1,2,3 就行，不用显示第4个)
+                    pass 
+                continue
+
+            # 正常卡片排列
+            if use_grid_mode:
+                # === 双列模式 ===
+                row = i // 2
+                col = i % 2
+                ch.grid(row=row, column=col, sticky="ew", padx=5, pady=5)
+            else:
+                # === 单列模式 ===
+                ch.grid(row=i, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 
     def process_caching(self, src_path, widget, lock_obj=None, no_wait=False):
         file_size = os.path.getsize(src_path)
