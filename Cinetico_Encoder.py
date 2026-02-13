@@ -585,8 +585,6 @@ class ToastNotification(ctk.CTkFrame):
     def destroy_toast(self):
         self.destroy()
 
-    
-
 class TaskCard(ctk.CTkFrame):
     def __init__(self, master, index, filepath, **kwargs):
         super().__init__(master, fg_color=COLOR_CARD, corner_radius=10, border_width=0, **kwargs)
@@ -596,6 +594,10 @@ class TaskCard(ctk.CTkFrame):
         self.ram_data = None 
         self.ssd_cache_path = None
         self.source_mode = "PENDING"
+        
+        # [核心修复 1/2] 初始化进度锁
+        self.ui_max_progress = 0.0
+        
         try: self.file_size_gb = os.path.getsize(filepath) / (1024**3)
         except: self.file_size_gb = 0.0
         self.lbl_index = ctk.CTkLabel(self, text=f"{index:02d}", font=("Impact", 22), 
@@ -626,22 +628,45 @@ class TaskCard(ctk.CTkFrame):
         try:
             if self.winfo_exists(): self.lbl_index.configure(text=f"{new_index:02d}")
         except: pass
+        
     def set_status(self, text, color="#888", code=None):
         try:
             if self.winfo_exists():
                 self.lbl_status.configure(text=text, text_color=color)
-                if code is not None: self.status_code = code
+                if code is not None: 
+                    self.status_code = code
+                    # [修复点] 这里非常关键！
+                    # 当状态变成 "编码中" (STATE_ENCODING = 4) 时，必须强制重置锁。
+                    # 否则，之前的 "内存/SSD加载完成" (100%) 会一直卡住进度条，
+                    # 导致 1% 的编码进度被当成错误数据拦截掉。
+                    if code == STATE_ENCODING or code == STATE_PENDING or code == STATE_DONE:
+                        self.ui_max_progress = 0.0
         except: pass
+        
     def set_progress(self, val, color=COLOR_ACCENT):
         try:
             if self.winfo_exists():
-                self.progress.set(val)
+                # 进度条防抖 + 单向锁定逻辑
+                if val == 0:
+                    self.ui_max_progress = 0.0
+                elif val >= 1.0:
+                    self.ui_max_progress = 1.0
+                elif val < self.ui_max_progress:
+                    # 拦截回退数据
+                    return 
+                
+                if val > self.ui_max_progress:
+                    self.ui_max_progress = val
+
+                self.progress.set(self.ui_max_progress)
                 self.progress.configure(progress_color=color)
         except: pass
+        
     def clean_memory(self):
         self.source_mode = "PENDING"
         self.ssd_cache_path = None
-
+        self.ui_max_progress = 0.0
+        
 class HelpWindow(ctk.CTkToplevel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1517,6 +1542,233 @@ class UltraEncoderApp(DnDWindow):
         top.grab_set()
 
     def launch_fireworks(self):
+        # 1. 基础检查：如果窗口不存在直接返回
+        if not self.winfo_exists(): return
+        
+        # 2. 创建顶层窗口
+        try:
+            top = ctk.CTkToplevel(self)
+            top.title("")
+            w, h = self.winfo_width(), self.winfo_height()
+            x, y = self.winfo_x(), self.winfo_y()
+            top.geometry(f"{w}x{h}+{x}+{y}")
+            top.overrideredirect(True) # 去除标题栏
+            top.transient(self)        # 让它跟随主窗口
+            
+            # === [核心修改] 跨平台透明化处理 ===
+            sys_plat = platform.system()
+            canvas_bg = "black" # 默认背景色
+
+            if sys_plat == "Windows":
+                # Windows 方案：设置背景为黑色，然后告诉系统“黑色=透明”
+                try:
+                    top.attributes("-transparentcolor", "black")
+                    top.attributes("-topmost", True)
+                except: pass
+                
+            elif sys_plat == "Darwin":
+                # Mac 方案：开启真透明模式，并将背景色设为系统透明色
+                try:
+                    # Mac 特有的透明属性
+                    top.attributes("-transparent", True)  
+                    # 必须将窗口背景和 Canvas 背景都设为 'systemTransparent'
+                    top.config(bg='systemTransparent')
+                    canvas_bg = 'systemTransparent'
+                    # Mac 上通常不需要 topmost，否则可能挡住其他操作，视情况而定
+                    # top.attributes("-topmost", True) 
+                except Exception as e:
+                    print(f"Mac Transparency Error: {e}")
+                    # 如果真透明失败（旧版系统），回退到半透明黑底，至少能看到烟花
+                    top.attributes("-alpha", 0.8)
+                    canvas_bg = "black"
+
+            # 3. 创建画布 (使用根据平台决定的背景色)
+            canvas = ctk.CTkCanvas(top, bg=canvas_bg, highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            
+            # 4. 烟花粒子参数 (保持原版数值)
+            particles = []
+            colors = [COLOR_ACCENT, "#F1C40F", "#E74C3C", "#2ECC71", "#9B59B6", "#00FFFF", "#FF00FF", "#FFFFFF"] 
+            particle_count = 180 
+            
+            # 左侧烟花源
+            for _ in range(particle_count):
+                particles.append({
+                    "x": random.uniform(-50, 100), 
+                    "y": h + random.uniform(0, 30), 
+                    "vx": random.gauss(18, 10), 
+                    "vy": random.gauss(-45, 12), 
+                    "grav": 2.0, 
+                    "size": random.uniform(3, 8), 
+                    "color": random.choice(colors), 
+                    "life": 1.0, 
+                    "decay": random.uniform(0.015, 0.030)
+                })
+            
+            # 右侧烟花源
+            for _ in range(particle_count):
+                particles.append({
+                    "x": random.uniform(w-100, w+50), 
+                    "y": h + random.uniform(0, 30), 
+                    "vx": random.gauss(-18, 10), 
+                    "vy": random.gauss(-45, 12), 
+                    "grav": 1.6, 
+                    "size": random.uniform(3, 8), 
+                    "color": random.choice(colors), 
+                    "life": 1.0, 
+                    "decay": random.uniform(0.015, 0.030)
+                })
+
+            # 5. 动画循环逻辑
+            def animate():
+                if not top.winfo_exists(): return
+                try:
+                    canvas.delete("all")
+                    alive_count = 0
+                    for p in particles:
+                        if p["life"] > 0:
+                            alive_count += 1
+                            tail_x, tail_y = p["x"], p["y"]
+                            
+                            # 物理更新
+                            p["x"] += p["vx"]
+                            p["y"] += p["vy"]
+                            p["vy"] += p["grav"] 
+                            p["vx"] *= 0.96
+                            p["life"] -= p["decay"]
+                            
+                            if p["life"] > 0.05:
+                                canvas.create_line(
+                                    tail_x, tail_y, p["x"], p["y"], 
+                                    fill=p["color"], 
+                                    width=p["size"] * p["life"], 
+                                    capstyle="round"
+                                )
+                    
+                    if alive_count > 0: 
+                        top.after(16, animate) # 约 60FPS
+                    else: 
+                        top.destroy()
+                        # 动画结束后，额外弹出一个 Toast 确保用户看到状态
+                        self.show_toast("✨ 所有任务已完成 / All Tasks Finished! ✨", "🏆")
+                except:
+                    if top.winfo_exists(): top.destroy()
+
+            # 启动动画
+            animate()
+            
+        except Exception as e:
+            print(f"Animation Error: {e}")
+            # 兜底方案：如果动画完全挂了，至少显示文字提示
+            if 'top' in locals() and top.winfo_exists(): top.destroy()
+            self.show_toast("✨ 所有任务已完成 / All Tasks Finished! ✨", "🏆")
+            
+        # === [兼容性修复] ===
+        # Mac/Linux 不支持 -transparentcolor，会导致黑屏遮挡。
+        # 因此在非 Windows 系统下，直接调用 Toast 通知代替动画。
+        if platform.system() != "Windows":
+            self.show_toast("✨ 所有任务已完成 / All Tasks Finished! ✨", "🏆")
+            return
+
+        if not self.winfo_exists(): return
+        
+        try:
+            top = ctk.CTkToplevel(self)
+            top.title("")
+            w, h = self.winfo_width(), self.winfo_height()
+            x, y = self.winfo_x(), self.winfo_y()
+            top.geometry(f"{w}x{h}+{x}+{y}")
+            top.overrideredirect(True)
+            top.transient(self)
+            
+            # Windows 专用透明穿透
+            # 如果在某些魔改版 Windows 系统报错，try-except 会捕获并安全退出
+            try:
+                top.attributes("-transparentcolor", "black")
+                top.attributes("-topmost", True) # 确保烟花在最上层
+            except:
+                top.destroy()
+                return
+
+            canvas = ctk.CTkCanvas(top, bg="black", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            
+            particles = []
+            colors = [COLOR_ACCENT, "#F1C40F", "#E74C3C", "#2ECC71", "#9B59B6", "#00FFFF", "#FF00FF", "#FFFFFF"] 
+            
+            # 增加粒子数量让效果更惊艳
+            particle_count = 180 
+            
+            # 左侧烟花源
+            for _ in range(particle_count):
+                particles.append({
+                    "x": random.uniform(-50, 100), 
+                    "y": h + random.uniform(0, 30), 
+                    "vx": random.gauss(18, 10),     # 调整喷射角度
+                    "vy": random.gauss(-45, 12),    # 调整高度
+                    "grav": 2.0, 
+                    "size": random.uniform(3, 8), 
+                    "color": random.choice(colors), 
+                    "life": 1.0, 
+                    "decay": random.uniform(0.015, 0.030) # 随机衰减
+                })
+            
+            # 右侧烟花源
+            for _ in range(particle_count):
+                particles.append({
+                    "x": random.uniform(w-100, w+50), 
+                    "y": h + random.uniform(0, 30), 
+                    "vx": random.gauss(-18, 10), 
+                    "vy": random.gauss(-45, 12), 
+                    "grav": 1.6, 
+                    "size": random.uniform(3, 8), 
+                    "color": random.choice(colors), 
+                    "life": 1.0, 
+                    "decay": random.uniform(0.015, 0.030)
+                })
+
+            def animate():
+                if not top.winfo_exists(): return
+                try:
+                    canvas.delete("all")
+                    alive_count = 0
+                    for p in particles:
+                        if p["life"] > 0:
+                            alive_count += 1
+                            tail_x, tail_y = p["x"], p["y"]
+                            
+                            # 物理模拟更新
+                            p["x"] += p["vx"]
+                            p["y"] += p["vy"]
+                            p["vy"] += p["grav"] 
+                            p["vx"] *= 0.96      # 增加空气阻力，效果更自然
+                            p["life"] -= p["decay"]
+                            
+                            if p["life"] > 0.05:
+                                # 绘制流星拖尾效果
+                                canvas.create_line(
+                                    tail_x, tail_y, p["x"], p["y"], 
+                                    fill=p["color"], 
+                                    width=p["size"] * p["life"], 
+                                    capstyle="round"
+                                )
+                    
+                    if alive_count > 0: 
+                        top.after(16, animate) # 锁定约 60FPS
+                    else: 
+                        top.destroy()
+                except:
+                    # 容错处理：如果窗口在动画中途被关闭
+                    if top.winfo_exists(): top.destroy()
+
+            animate()
+            
+        except Exception as e:
+            print(f"Animation Error: {e}")
+            # 发生任何错误都直接销毁窗口，防止残留黑框
+            if 'top' in locals() and top.winfo_exists():
+                top.destroy()
+                
         if not self.winfo_exists(): return
         top = ctk.CTkToplevel(self)
         top.title("")
@@ -1719,41 +1971,95 @@ class UltraEncoderApp(DnDWindow):
             temp_output_filename = f"TEMP_ENC_{uuid.uuid4().hex}.mp4"
             working_output_file = os.path.join(self.temp_dir, temp_output_filename)
             
-            # 使用全局 FFMPEG_PATH
+            # =========================================================
+            # === [修复版] 构建 FFmpeg 命令 (自动识别 Win/Mac) ===
+            # =========================================================
             cmd = [FFMPEG_PATH, "-y"]
+            
+            # --- 1. 硬件解码参数配置 ---
             if final_hw_decode:
-                cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
-                cmd.extend(["-extra_hw_frames", "2"]) 
+                if platform.system() == "Darwin":
+                    # Mac 硬件解码
+                    cmd.extend(["-hwaccel", "videotoolbox"])
+                else:
+                    # Windows (NVIDIA) 硬件解码
+                    cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+                    cmd.extend(["-extra_hw_frames", "2"]) 
+
+            # --- 2. 输入源参数 ---
             if not final_hw_decode and card.source_mode == "RAM":
                 cmd.extend(["-probesize", "50M", "-analyzeduration", "100M"])
+            
             cmd.extend(["-i", input_video_source])
             if has_audio: cmd.extend(["-i", temp_audio_wav])
+            
+            # --- 3. 映射流 ---
             cmd.extend(["-map", "0:v:0"])
             if has_audio: cmd.extend(["-map", "1:a:0"])
-            v_codec = "libx264" 
+
+            # --- 4. 编码器选择逻辑 ---
+            v_codec = "libx264" # 默认 CPU 编码
             if final_hw_encode:
-                if "H.264" in codec_sel: v_codec = "h264_nvenc"
-                elif "H.265" in codec_sel: v_codec = "hevc_nvenc"
-                elif "AV1" in codec_sel: v_codec = "av1_nvenc"
-                cmd.extend(["-c:v", v_codec])
-            use_10bit = self.depth_10bit_var.get()
-            if final_hw_encode and "H.264" in codec_sel and use_10bit: use_10bit = False
-            if final_hw_encode:
-                if use_10bit:
-                    if final_hw_decode: cmd.extend(["-vf", "scale_cuda=format=p010le"]) 
-                    else: cmd.extend(["-pix_fmt", "p010le"])
+                if platform.system() == "Darwin":
+                    # === Mac VideoToolbox 编码器 ===
+                    if "H.264" in codec_sel: v_codec = "h264_videotoolbox"
+                    elif "H.265" in codec_sel: v_codec = "hevc_videotoolbox"
+                    elif "AV1" in codec_sel: 
+                        # 目前大多数 Mac 不支持 AV1 硬编，回退到 CPU 防止报错
+                        # (M3 Pro/Max 支持，但为了兼容性建议先软解，或者你需要手动改为 libaom-av1)
+                        v_codec = "libsvtav1"
+                        final_hw_encode = False 
                 else:
-                    if final_hw_decode: cmd.extend(["-vf", "scale_cuda=format=yuv420p"]) 
-                    else: cmd.extend(["-pix_fmt", "yuv420p"]) 
-                cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), "-b:v", "0"])
-                if "AV1" not in codec_sel: cmd.extend(["-preset", "p4"])
+                    # === Windows NVENC 编码器 ===
+                    if "H.264" in codec_sel: v_codec = "h264_nvenc"
+                    elif "H.265" in codec_sel: v_codec = "hevc_nvenc"
+                    elif "AV1" in codec_sel: v_codec = "av1_nvenc"
+                
+                cmd.extend(["-c:v", v_codec])
+
+            # --- 5. 编码参数 (色深、码率控制) ---
+            use_10bit = self.depth_10bit_var.get()
+            # 修正：部分 H.264 硬编不支持 10bit，强制关闭以防报错
+            if final_hw_encode and "H.264" in codec_sel and use_10bit: use_10bit = False
+
+            if final_hw_encode:
+                # === 硬件编码参数 ===
+                if platform.system() == "Darwin":
+                    # [Mac 特有配置]
+                    # VideoToolbox 不支持 -rc vbr -cq，而是使用 -q:v (0-100, 越高越好)
+                    # 我们需要把 CRF (16-40, 越低越好) 映射反转一下
+                    # 映射算法：CRF 20 -> Q 75, CRF 30 -> Q 50
+                    mac_quality = int(100 - (self.crf_var.get() * 2.2))
+                    if mac_quality < 20: mac_quality = 20
+                    cmd.extend(["-q:v", str(mac_quality)])
+                    
+                    # Mac 10-bit 处理
+                    if use_10bit: cmd.extend(["-pix_fmt", "p010le"])
+                    else: cmd.extend(["-pix_fmt", "yuv420p"])
+
+                else:
+                    # [Windows/NVIDIA 特有配置]
+                    if use_10bit:
+                        if final_hw_decode: cmd.extend(["-vf", "scale_cuda=format=p010le"]) 
+                        else: cmd.extend(["-pix_fmt", "p010le"])
+                    else:
+                        if final_hw_decode: cmd.extend(["-vf", "scale_cuda=format=yuv420p"]) 
+                        else: cmd.extend(["-pix_fmt", "yuv420p"]) 
+                    
+                    cmd.extend(["-rc", "vbr", "-cq", str(self.crf_var.get()), "-b:v", "0"])
+                    if "AV1" not in codec_sel: cmd.extend(["-preset", "p4"])
+
             else:
+                # === CPU 纯软解参数 (通用) ===
                 if use_10bit: cmd.extend(["-pix_fmt", "yuv420p10le"])
                 else: cmd.extend(["-pix_fmt", "yuv420p"])
                 cmd.extend(["-crf", str(self.crf_var.get()), "-preset", "medium"])
+            
+            # --- 6. 其他参数 ---
             if has_audio: cmd.extend(["-c:a", "aac", "-b:a", "320k"])
             if self.keep_meta_var.get(): cmd.extend(["-map_metadata", "0"])
             cmd.extend(["-progress", "pipe:1", "-nostats", working_output_file])
+            # =========================================================
 
             # 使用 subprocess 跨平台参数
             kwargs = get_subprocess_args()
@@ -1773,37 +2079,59 @@ class UltraEncoderApp(DnDWindow):
             tag_info = f"Dec:{info_decode} | Enc:{info_encode}"
             if card.source_mode == "RAM": tag_info += " | RAM"
             self.safe_update(ch_ui.activate, fname, tag_info)
+            # =========================================================
+            # === [修复版] 进度读取循环 (解决 Mac 进度条回跳/抽动问题) ===
+            # =========================================================
             progress_stats = {}
             start_t = time.time()
             last_ui_update_time = 0 
-            ui_update_interval = 0.3
+            ui_update_interval = 0.1 # 加快刷新频率让动画更丝滑
+            max_prog_reached = 0.0   # [核心修复] 记录已达到的最大进度
+            
             for line in proc.stdout:
                 if self.stop_flag: break
                 try: 
                     line_str = line.decode('utf-8', errors='ignore').strip()
                     if not line_str: continue
+                    
                     if "=" in line_str:
                         key, value = line_str.split("=", 1)
                         progress_stats[key.strip()] = value.strip()
+                        
                         if key.strip() == "out_time_us":
                             now = time.time()
+                            # 限制 UI 刷新频率，防止主线程卡顿
                             if now - last_ui_update_time > ui_update_interval:
                                 fps = float(progress_stats.get("fps", "0")) if "fps" in progress_stats else 0.0
                                 current_us = int(value.strip())
-                                prog = min(1.0, (current_us / 1000000.0) / duration)
+                                
+                                # 计算原始进度
+                                raw_prog = (current_us / 1000000.0) / duration
+                                
+                                # [核心修复逻辑]
+                                # 只有当新进度大于历史最大进度时，才更新 UI
+                                # 这样可以过滤掉 B 帧造成的“时间戳回退”，解决进度条抽搐
+                                if raw_prog > max_prog_reached:
+                                    max_prog_reached = raw_prog
+                                
+                                # 确保不超过 100%
+                                final_prog = min(1.0, max_prog_reached)
+                                
                                 eta = "--:--"
                                 elapsed = now - start_t
-                                if prog > 0.005:
-                                    eta_sec = (elapsed / prog) - elapsed
+                                if final_prog > 0.005:
+                                    eta_sec = (elapsed / final_prog) - elapsed
                                     if eta_sec < 0: eta_sec = 0
                                     eta = f"{int(eta_sec//60):02d}:{int(eta_sec%60):02d}"
+                                
                                 ratio = 0.0
-                                if os.path.exists(working_output_file) and prog > 0.01:
+                                if working_output_file and os.path.exists(working_output_file) and final_prog > 0.01:
                                     curr_size = os.path.getsize(working_output_file)
-                                    in_proc = input_size * prog
+                                    in_proc = input_size * final_prog
                                     if in_proc > 0: ratio = (curr_size / in_proc) * 100
-                                self.safe_update(ch_ui.update_data, fps, prog, eta, ratio)
-                                self.safe_update(card.set_progress, prog, COLOR_ACCENT)
+                                
+                                self.safe_update(ch_ui.update_data, fps, final_prog, eta, ratio)
+                                self.safe_update(card.set_progress, final_prog, COLOR_ACCENT)
                                 last_ui_update_time = now
                 except: pass
             proc.wait()
