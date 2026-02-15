@@ -1129,7 +1129,7 @@ class UltraEncoderApp(DnDWindow):
             title_font = ("Segoe UI Black", 36)
         else:
             # Mac/Linux 使用 Arial Black (Mac上最接近的粗体)
-            title_font = ("Arial Black", 36)
+            title_font = ("Impact", 36)
             
         ctk.CTkLabel(title_box, text="Cinético", font=title_font, text_color="#FFF").pack(side="left")
         # ==========================================        
